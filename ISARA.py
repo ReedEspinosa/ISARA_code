@@ -84,6 +84,10 @@ def Retr_CRI(wvl_dict,
     RRI_p = {}
     IRI_p = {}
     for imode in sd:
+      #if imode == 'SMPS':
+        #RRI_p[imode] = 1.4
+        #IRI_p[imode] = 0.01       
+      #else:
       RRI_p[imode] = CRI_p[i1,0]
       IRI_p[imode] = CRI_p[i1,1]
     ##  
