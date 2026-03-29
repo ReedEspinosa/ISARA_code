@@ -265,7 +265,7 @@ def Retr_kappa(wvl_dict,
         ref_scat_coef[i2] = optical_measurements[f'wet_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
       ##  
       Cdif = abs(ref_scat_coef-scat_coef)/ref_scat_coef # calculate absolute relative difference of scattering coefficients in each channel
-      if Cdif<0.01: # solution is valid if scattering coefficients are within 1%
+      if np.all(Cdif<0.01): # solution is valid if scattering coefficients are within 1%
         Results["kappa_unitless"] = kappa_p[i1] # store retrieved kappa
         ## store calculated scattering and extinction coefficients and SSA for measured and validation wavelengths
         for i2 in range(L2):

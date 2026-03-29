@@ -1,0 +1,44 @@
+{
+  "campaign_name": "ACTIVATE",
+  "data_directory": "InsituData",
+  "instruments": [
+    {
+      "name": "SMPS",
+      "lower_bound_nm": 10,
+      "upper_bound_nm": 500
+    },
+    {
+      "name": "UHSAS",
+      "lower_bound_nm": 500,
+      "upper_bound_nm": 1000
+    }
+  ],
+  "dry_channels": [
+    {
+      "scattering_wavelength_nm": 450,
+      "absorption_wavelength_nm": 465,
+      "color": "Blue"
+    },
+    {
+      "scattering_wavelength_nm": 550,
+      "absorption_wavelength_nm": 520,
+      "color": "Green"
+    },
+    {
+      "scattering_wavelength_nm": 700,
+      "absorption_wavelength_nm": 660,
+      "color": "Red"
+    }
+  ],
+  "wet_channels": [
+    {
+      "scattering_wavelength_nm": 450,
+      "color": "Blue"
+    }
+  ],
+  "additional_wavelengths": {
+    "wavelengths_nm": [370, 530, 1060],
+    "colors": ["Blue", "Green", "Red"]
+  }
+}
+

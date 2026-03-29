@@ -5,21 +5,39 @@ import load_sizebins
 import numpy as np
 import os
 import sys
+import json
 from pathos.multiprocessing import ProcessPool
-def RunISARA():
+def RunISARA(config_file=None):
 
     """
     Saves a dictionary file of each of the merged data files in source directory that includes ISARA retrievals of CRI and kappa. Dictionary includes metadata for netCDF compliancy.
 
+    Parameters
+    ----------
+    config_file : str, optional
+        Path to JSON configuration file. If provided, all configuration will be loaded from this file
+        instead of prompting the user interactively. If None, the function will prompt for all inputs.
+        See isara_config_template.json for the expected format.
+
+    Examples
+    --------
     >>> import ISARA_Data_Retrieval
+    >>> # Interactive mode (original behavior)
     >>> ISARA_Data_Retrieval.RunISARA()
-    activate-mrg-activate-large-smps_hu25_20200214_R0_20230831T150854.ict
-    182
-    182
-    182
+    >>> # Configuration file mode
+    >>> ISARA_Data_Retrieval.RunISARA(config_file='my_config.json')
     """   
     path_optical_dataset='./optical_dataset/'
     path_mopsmap_executable=r'./mopsmap'
+    
+    # Load configuration from file if provided
+    config = None
+    if config_file is not None:
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(f"Configuration file not found: {config_file}")
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded configuration from {config_file}")
 
     sys.path.insert(0, os.path.abspath("../"))  
 
@@ -371,12 +389,80 @@ def RunISARA():
     #rho_dry = 2.63
     rho_wet = 1.00  
 
-    DN = input("Enter the campaign name (e.g., ACTIVATE): ")   
-    #dryorSP = input("Is the dry RH specified? Enter yes or no: ")
-    nummodes = int(input("Enter number of size distributions measured: "))
-    modelist = np.empty(nummodes).astype(str)  
-    UBcutoff = {}    
-    LBcutoff = {}   
+    # Load configuration from file or prompt user
+    if config is not None:
+        # Load from config file
+        DN = config["campaign_name"]
+        data_directory = config["data_directory"]
+        nummodes = len(config["instruments"])
+        modelist = np.array([inst["name"] for inst in config["instruments"]]).astype(str)
+        UBcutoff = {}
+        LBcutoff = {}
+        for inst in config["instruments"]:
+            UBcutoff[inst["name"]] = inst["upper_bound_nm"] * pow(10, -3)
+            LBcutoff[inst["name"]] = inst["lower_bound_nm"] * pow(10, -3)
+        
+        # Load dry channels
+        numwvl = len(config["dry_channels"])
+        dry_wvl = {}
+        dry_wvl["sca"] = np.array([ch["scattering_wavelength_nm"] for ch in config["dry_channels"]]).astype(int)
+        dry_wvl["abs"] = np.array([ch["absorption_wavelength_nm"] for ch in config["dry_channels"]]).astype(int)
+        dry_channel_color = np.array([ch["color"] for ch in config["dry_channels"]]).astype(str)
+        
+        # Load wet channels
+        numwvl_wet = len(config["wet_channels"])
+        wet_wvl = {}
+        wet_wvl["sca"] = np.array([ch["scattering_wavelength_nm"] for ch in config["wet_channels"]]).astype(int)
+        wet_channel_color = np.array([ch["color"] for ch in config["wet_channels"]]).astype(str)
+        
+        # Load additional wavelengths (optional)
+        if "additional_wavelengths" in config and config["additional_wavelengths"] is not None:
+            val_wvl = np.array(config["additional_wavelengths"]["wavelengths_nm"]).astype(int)
+            val_channel_color = np.array(config["additional_wavelengths"]["colors"]).astype(str)
+        else:
+            val_wvl = None
+            val_channel_color = None
+    else:
+        # Interactive prompts (original behavior)
+        DN = input("Enter the campaign name (e.g., ACTIVATE): ")   
+        data_directory = input("Enter the name of the directory that contains\nin-situ measurements (e.g., InsituData): ")
+        nummodes = int(input("Enter number of size distributions measured: "))
+        modelist = np.empty(nummodes).astype(str)  
+        UBcutoff = {}    
+        LBcutoff = {}
+        
+        # Load dry channels
+        numwvl = int(input("Enter number of dry spectral channels measured (e.g., 3): "))
+        dry_wvl = {}
+        dry_wvl["sca"] = np.full(numwvl,np.nan).astype(int)
+        dry_wvl["abs"] = np.full(numwvl,np.nan).astype(int)
+        dry_channel_color = np.full(numwvl,np.nan).astype(str) 
+        for iwvl in range(numwvl):
+            dry_wvl["sca"][iwvl] = input(f"Enter scattering wavelength associated with channel {iwvl+1} in nm (e.g., 450): ")
+            dry_wvl["abs"][iwvl] = input(f"Enter absorption wavelength associated with channel {iwvl+1} in nm (e.g., 465): ")
+            dry_channel_color[iwvl] = input(f"Enter the wavelength color to represent channel {iwvl+1} (e.g., Blue, Green, or Red): ")
+
+        # Load wet channels
+        numwvl_wet = int(input("Enter number of humidified spectral channels measured (e.g., 1): "))
+        wet_wvl = {}
+        wet_wvl["sca"] = np.full(numwvl_wet,np.nan).astype(int)
+        wet_channel_color = np.full(numwvl_wet,np.nan).astype(str) 
+        for iwvl in range(numwvl_wet):
+            wet_wvl["sca"][iwvl]  = input(f"Enter scattering wavelength associated with channel {iwvl+1} in nm (e.g., 450): ")
+            wet_channel_color[iwvl] = input(f"Enter the wavelength color to represent channel {iwvl+1} (e.g., Blue, Green, or Red): ")
+
+        # Additional wavelengths
+        addwvl = input(f"Are there any additional wavelengths needed? (yes or no): ")
+        if addwvl == "yes":
+            valwvl = input(f"Enter the additional wavelength channels speparated\nby a comma and a space (e.g., 370, 530, 1060): ")
+            val_wvl =  np.array(valwvl.split(", ")).astype(int)
+            valcolor = input(f"Enter the additional wavelength channels colors speparated\nby a comma and a space (e.g., Blue, Green, Red): ")
+            val_channel_color =  np.array(valcolor.split(", ")).astype(str)
+        else:
+            val_wvl = None
+            val_channel_color = None
+    
+    # Load size bin data for each instrument (common to both modes)
     dpg = {}
     dpu = {}
     dpl = {}
@@ -386,16 +472,19 @@ def RunISARA():
     full_dp["dpu"] = None
     full_dp["dpl"] = None
     for i1 in range(nummodes):
-        keyname = input(f"Enter the instrument name for mode {i1+1} data (e.g., LAS): ")
-        modelist[i1] = keyname
+        keyname = modelist[i1]
+        if config is None:
+            # Interactive mode: prompt for instrument name and cutoffs
+            keyname = input(f"Enter the instrument name for mode {i1+1} data (e.g., LAS): ")
+            modelist[i1] = keyname
+            UBcutoff[keyname] = float(input(f"Enter the upper bound of particle sizes\nfor {keyname} data in nm (e.g., 125): "))*pow(10,-3)
+            LBcutoff[keyname] = float(input(f"Enter the lower bound of particle sizes\nfor {keyname} data in nm (e.g., 10): "))*pow(10,-3)
+        
         ifn = [f for f in os.listdir(f'./misc/{DN}/SDBinInfo/') if f.__contains__(keyname)]
         dpData = load_sizebins.Load(f'./misc/{DN}/SDBinInfo/{ifn[0]}')
-        #print(dpData)
         dpg[keyname] = grab_data(dpData,"Mid Points")*pow(10,-3) 
         dpu[keyname] = grab_data(dpData,"Upper Bounds")*pow(10,-3) 
         dpl[keyname] = grab_data(dpData,"Lower Bounds")*pow(10,-3) 
-        UBcutoff[keyname] = float(input(f"Enter the upper bound of particle sizes\nfor {keyname} data in nm (e.g., 125): "))*pow(10,-3)
-        LBcutoff[keyname] = float(input(f"Enter the lower bound of particle sizes\nfor {keyname} data in nm (e.g., 10): "))*pow(10,-3)
         dpcutoffflg = np.where((dpl[keyname]>=LBcutoff[keyname])&(dpu[keyname]<=UBcutoff[keyname]))[0]
         maxdpglength += len(dpcutoffflg)
         if i1 == 0:
@@ -406,33 +495,6 @@ def RunISARA():
             full_dp["dpg"] = np.hstack((full_dp["dpg"],dpg[keyname][dpcutoffflg]))
             full_dp["dpu"] = np.hstack((full_dp["dpu"],dpu[keyname][dpcutoffflg]))
             full_dp["dpl"] = np.hstack((full_dp["dpl"],dpl[keyname][dpcutoffflg]))
-    numwvl = int(input("Enter number of dry spectral channels measured (e.g., 3): "))
-    dry_wvl = {}
-    dry_wvl["sca"] = np.full(numwvl,np.nan).astype(int)
-    dry_wvl["abs"] = np.full(numwvl,np.nan).astype(int)
-    dry_channel_color = np.full(numwvl,np.nan).astype(str) 
-    for iwvl in range(numwvl):
-        dry_wvl["sca"][iwvl] = input(f"Enter scattering wavelength associated with channel {iwvl+1} in nm (e.g., 450): ")
-        dry_wvl["abs"][iwvl] = input(f"Enter absorption wavelength associated with channel {iwvl+1} in nm (e.g., 465): ")
-        dry_channel_color[iwvl] = input(f"Enter the wavelength color to represent channel {iwvl+1} (e.g., Blue, Green, or Red): ")
-
-    numwvl = int(input("Enter number of humidified spectral channels measured (e.g., 1): "))
-    wet_wvl = {}
-    wet_wvl["sca"] = np.full(numwvl,np.nan).astype(int)
-    wet_channel_color = np.full(numwvl,np.nan).astype(str) 
-    for iwvl in range(numwvl):
-        wet_wvl["sca"][iwvl]  = input(f"Enter scattering wavelength associated with channel {iwvl+1} in nm (e.g., 450): ")
-        wet_channel_color[iwvl] = input(f"Enter the wavelength color to represent channel {iwvl+1} (e.g., Blue, Green, or Red): ")
-
-    addwvl = input(f"Are there any additional wavelengths needed? (yes or no): ")
-    if addwvl == "yes":
-        valwvl = input(f"Enter the additional wavelength channels speparated\nby a comma and a space (e.g., 370, 530, 1060): ")
-        val_wvl =  np.array(valwvl.split(", ")).astype(int)
-        valcolor = input(f"Enter the additional wavelength channels colors speparated\nby a comma and a space (e.g., Blue, Green, Red): ")
-        val_channel_color =  np.array(valcolor.split(", ")).astype(str)
-    else:
-        val_wvl = None
-    data_directory = input("Enter the name of the directory that contains\nin-situ measurements (e.g., InsituData): ")
     IFN = [f for f in os.listdir(f'./misc/{DN}/{data_directory}/') if f.endswith('.ict')]
     #b = np.array([39,126,138,169,170,171]).astype(int)#39,126,138,169,170,171
     #b = range(15,39,1)
