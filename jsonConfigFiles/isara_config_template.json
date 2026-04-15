@@ -32,8 +32,8 @@
   ],
   "wet_channels": [
     {
-      "scattering_wavelength_nm": 450,
-      "color": "Blue"
+      "scattering_wavelength_nm": 550,
+      "color": "Green"
     }
   ],
   "additional_wavelengths": {

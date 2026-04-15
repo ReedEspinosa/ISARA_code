@@ -7,6 +7,27 @@ import os
 import sys
 import json
 from pathos.multiprocessing import ProcessPool
+
+HYGROSCOPIC_WVL_NM = 550
+
+def interp_abs_at_wvl(abs_wvls, abs_values, target_wvl):
+    """Log-log linear (Angstrom) interpolation of absorption to target_wvl.
+    Nearest-neighbor extrapolation outside the range or when only one usable
+    point remains. NaN and non-positive inputs are screened; returns NaN if
+    no usable points remain.
+    """
+    w = np.asarray(abs_wvls, dtype=float)
+    a = np.asarray(abs_values, dtype=float)
+    valid = np.isfinite(a) & (a > 0)
+    w, a = w[valid], a[valid]
+    if w.size == 0:
+        return np.nan
+    order = np.argsort(w)
+    w, a = w[order], a[order]
+    if w.size == 1 or target_wvl <= w[0] or target_wvl >= w[-1]:
+        return float(a[np.argmin(np.abs(w - target_wvl))])
+    return float(np.exp(np.interp(np.log(target_wvl), np.log(w), np.log(a))))
+
 def RunISARA(config_file=None):
 
     """
@@ -75,7 +96,7 @@ def RunISARA(config_file=None):
             Abs[AbsorKey]=Absor
         RHsc,kynmRH = grab_keydata('RH_Sc')
         RHsc= np.array(RHsc)
-        gamma,kynmgamma = grab_keydata('gamma550')
+        gamma,kynmgamma = grab_keydata(f'gamma{HYGROSCOPIC_WVL_NM}')
         gamma= np.array(gamma)
         print(RHsc.size,gamma.size)
 
@@ -129,10 +150,17 @@ def RunISARA(config_file=None):
                 if (np.logical_not(np.isnan(finalout[f'dry_meas_sca_coef_{dry_wvl["sca"][iwvl]}_m-1']))&(finalout[f'dry_meas_sca_coef_{dry_wvl["sca"][iwvl]}_m-1']>10**(-6))):
                     measflg += 1
 
-                if kwvl.__contains__(str(dry_wvl["sca"][1])):
-                    finalout[f'wet_meas_sca_coef_{dry_wvl["sca"][1]}_m-1'] = np.multiply(measured_Sc_dry[kwvl][i1], pow(10, -6))/(np.exp(gamma[i1]*np.log((100-80)/(100-RHsc[i1]))))
-                    finalout[f'wet_meas_ext_coef_{dry_wvl["sca"][1]}_m-1'] = finalout[f'wet_meas_sca_coef_{dry_wvl["sca"][1]}_m-1']+finalout[f'dry_meas_abs_coef_{dry_wvl["abs"][1]}_m-1']
-                    finalout[f'meas_fRH_{dry_wvl["sca"][1]}_unitless'] = finalout[f'wet_meas_sca_coef_{dry_wvl["sca"][1]}_m-1']/finalout[f'dry_meas_sca_coef_{dry_wvl["sca"][1]}_m-1']
+                if dry_wvl["sca"][iwvl] == HYGROSCOPIC_WVL_NM:
+                    wet_sca = np.multiply(measured_Sc_dry[kwvl][i1], pow(10, -6))/(np.exp(gamma[i1]*np.log((100-80)/(100-RHsc[i1]))))
+                    abs_values = np.array([finalout[f'dry_meas_abs_coef_{w}_m-1'] for w in dry_wvl["abs"]])
+                    abs_at_hyg = interp_abs_at_wvl(dry_wvl["abs"], abs_values, HYGROSCOPIC_WVL_NM)
+                    finalout[f'wet_meas_sca_coef_{HYGROSCOPIC_WVL_NM}_m-1'] = wet_sca
+                    finalout[f'wet_meas_ext_coef_{HYGROSCOPIC_WVL_NM}_m-1'] = wet_sca + abs_at_hyg
+                    dry_sca = finalout[f'dry_meas_sca_coef_{HYGROSCOPIC_WVL_NM}_m-1']
+                    if np.isfinite(dry_sca) and dry_sca > 1e-10:
+                        finalout[f'meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = wet_sca/dry_sca
+                    else:
+                        finalout[f'meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = np.nan
                 iwvl += 1     
     
             dndlogdp = {}
@@ -215,7 +243,7 @@ def RunISARA(config_file=None):
                         full_dpg[idpg] = fulldpg[fulldpflg]
                         full_dpu[idpg] = fulldpu[fulldpflg]
                 for idpg in range(len(full_dp["dpg"])):
-                    finalout[f'dndlogdp_bin{idpg}_cm-3'] = full_sd[idpg]       
+                    finalout[f'dndlogdp_bin{idpg}_m-3'] = full_sd[idpg]       
                     finalout[f'dpl_bin{idpg}_um'] = full_dpl[idpg]
                     finalout[f'dpg_bin{idpg}_um'] = full_dpg[idpg]
                     finalout[f'dpu_bin{idpg}_um'] = full_dpu[idpg]          
@@ -243,7 +271,7 @@ def RunISARA(config_file=None):
 
 
                     #if (RH_amb[i1].astype(str) != 'nan') and (measured_coef_wet[i1].astype(str) != 'nan'):
-                    if np.logical_not(np.isnan(finalout[f'wet_meas_sca_coef_550_m-1'])):
+                    if np.logical_not(np.isnan(finalout[f'wet_meas_sca_coef_{HYGROSCOPIC_WVL_NM}_m-1'])):
                         finalout['attempt_flag_kappa_unitless'] = 1
                         Results = ISARA.Retr_kappa(wet_wvl, val_wvl, finalout, Dndlogdp, Dpg, 80, kappa_p, CRI_dry,
                             Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
@@ -254,9 +282,9 @@ def RunISARA(config_file=None):
                             for key in Results:
                                 finalout[key] = Results[key]
                             #print(finalout["kappa"])    
-                            finalout[f'cal_fRH_550_unitless'] = finalout[f'wet_cal_sca_coef_550_m-1']/finalout[f'dry_cal_sca_coef_550_m-1']
+                            finalout[f'cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = finalout[f'wet_cal_sca_coef_{HYGROSCOPIC_WVL_NM}_m-1']/finalout[f'dry_cal_sca_coef_{HYGROSCOPIC_WVL_NM}_m-1']
                         else:
-                            finalout[f'cal_fRH_550_unitless'] = np.nan
+                            finalout[f'cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = np.nan
                             finalout[f'kappa_unitless'] = np.nan
                             for i2 in range(len(wet_wvl["sca"])):
                                 finalout[f'wet_cal_sca_coef_{wet_wvl["sca"][i2]}_m-1'] = np.nan
@@ -293,7 +321,7 @@ def RunISARA(config_file=None):
                         finalout[f'dry_cal_ext_coef_{dry_wvl["sca"][i2]}_m-1'] = np.nan
                         finalout[f'dry_cal_ext_coef_{dry_wvl["abs"][i2]}_m-1'] = np.nan    
 
-                    finalout[f'cal_fRH_550_unitless'] = np.nan
+                    finalout[f'cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = np.nan
                     finalout[f'kappa_unitless'] = np.nan
                     for i2 in range(len(wet_wvl["sca"])):
                         finalout[f'wet_cal_sca_coef_{wet_wvl["sca"][i2]}_m-1'] = np.nan
@@ -324,7 +352,7 @@ def RunISARA(config_file=None):
                                 finalout[f'dry_cal_ext_coef_{val_wvl[i2]}_m-1'] = np.nan                       
             else:
                 for idpg in range(len(full_dp["dpg"])):
-                    finalout[f'dndlogdp_bin{idpg}_cm-3'] = np.nan       
+                    finalout[f'dndlogdp_bin{idpg}_m-3'] = np.nan       
                     finalout[f'dpl_bin{idpg}_um'] = np.nan
                     finalout[f'dpg_bin{idpg}_um'] = np.nan
                     finalout[f'dpu_bin{idpg}_um'] = np.nan                  
@@ -338,7 +366,7 @@ def RunISARA(config_file=None):
                     finalout[f'dry_cal_ext_coef_{dry_wvl["sca"][i2]}_m-1'] = np.nan
                     finalout[f'dry_cal_ext_coef_{dry_wvl["abs"][i2]}_m-1'] = np.nan
 
-                finalout[f'cal_fRH_550_unitless'] = np.nan
+                finalout[f'cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = np.nan
                 finalout[f'kappa_unitless'] = np.nan
                 for i2 in range(len(wet_wvl["sca"])):
                     finalout[f'wet_cal_sca_coef_{wet_wvl["sca"][i2]}_m-1'] = np.nan
@@ -461,7 +489,18 @@ def RunISARA(config_file=None):
         else:
             val_wvl = None
             val_channel_color = None
-    
+
+    if HYGROSCOPIC_WVL_NM not in dry_wvl["sca"]:
+        raise ValueError(
+            f"Hygroscopic wavelength {HYGROSCOPIC_WVL_NM} nm must be one of the "
+            f"dry scattering channels; got dry_wvl['sca']={list(dry_wvl['sca'])}."
+        )
+    if HYGROSCOPIC_WVL_NM not in wet_wvl["sca"]:
+        raise ValueError(
+            f"Hygroscopic wavelength {HYGROSCOPIC_WVL_NM} nm must be one of the "
+            f"wet scattering channels; got wet_wvl['sca']={list(wet_wvl['sca'])}."
+        )
+
     # Load size bin data for each instrument (common to both modes)
     dpg = {}
     dpu = {}
@@ -548,16 +587,16 @@ def RunISARA(config_file=None):
             output_dict['VariableAttributes']["attempt_flag_kappa_unitless"]['long_name'] = 'Flags points where all measurements required for ISARA CRI and kappa retrieval and whether or not kappa was successfully retrieved.'
             output_dict['VariableAttributes']["attempt_flag_kappa_unitless"]['flag_values'] = '0 1 2'   
             output_dict['VariableAttributes']["attempt_flag_kappa_unitless"]['flag_meanings'] = 'no_attempt attempt success' 
-            output_dict['VariableAttributes']["cal_fRH_550_unitless"] = {}    
-            output_dict['VariableAttributes']["cal_fRH_550_unitless"]['short_name'] = 'cal_fRH'
-            output_dict['VariableAttributes']["cal_fRH_550_unitless"]['units'] = '1'
-            output_dict['VariableAttributes']["cal_fRH_550_unitless"]['long_name'] = 'Optical hygrsocopic growth factor at 550 nm of BULK particles derived from ISARA.'
-            output_dict['VariableAttributes']["cal_fRH_550_unitless"]['ACVSNC_standard_name'] = 'AerOpt_fRHScat_InSitu_Green_RHd_Bulk_None'
-            output_dict['VariableAttributes']["meas_fRH_550_unitless"] = {}    
-            output_dict['VariableAttributes']["meas_fRH_550_unitless"]['short_name'] = 'meas_fRH'
-            output_dict['VariableAttributes']["meas_fRH_550_unitless"]['units'] = '1'
-            output_dict['VariableAttributes']["meas_fRH_550_unitless"]['long_name'] = 'Optical hygrsocopic growth factor at 550 nm of BULK particles derived from gamma measurement.'
-            output_dict['VariableAttributes']["meas_fRH_550_unitless"]['ACVSNC_standard_name'] = 'AerOpt_fRHScat_InSitu_Green_RHd_Bulk_None'
+            output_dict['VariableAttributes'][f"cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless"] = {}
+            output_dict['VariableAttributes'][f"cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['short_name'] = 'cal_fRH'
+            output_dict['VariableAttributes'][f"cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['units'] = '1'
+            output_dict['VariableAttributes'][f"cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['long_name'] = f'Optical hygrsocopic growth factor at {HYGROSCOPIC_WVL_NM} nm of BULK particles derived from ISARA.'
+            output_dict['VariableAttributes'][f"cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['ACVSNC_standard_name'] = 'AerOpt_fRHScat_InSitu_Green_RHd_Bulk_None'
+            output_dict['VariableAttributes'][f"meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless"] = {}
+            output_dict['VariableAttributes'][f"meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['short_name'] = 'meas_fRH'
+            output_dict['VariableAttributes'][f"meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['units'] = '1'
+            output_dict['VariableAttributes'][f"meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['long_name'] = f'Optical hygrsocopic growth factor at {HYGROSCOPIC_WVL_NM} nm of BULK particles derived from gamma measurement.'
+            output_dict['VariableAttributes'][f"meas_fRH_{HYGROSCOPIC_WVL_NM}_unitless"]['ACVSNC_standard_name'] = 'AerOpt_fRHScat_InSitu_Green_RHd_Bulk_None'
             output_dict['VariableAttributes']["kappa_unitless"] = {}
             output_dict['VariableAttributes']["kappa_unitless"]['short_name'] = 'kappa'
             output_dict['VariableAttributes']["kappa_unitless"]['units'] = '1'

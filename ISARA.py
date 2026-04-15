@@ -102,13 +102,13 @@ def Retr_CRI(wvl_dict,
       ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
 
     ##
-    Cdif1 = abs(ref_scat_coef-scat_coef)/ref_scat_coef # calculate absolute relative difference of scattering coefficients in each channel
+    Cdif1 = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10) # calculate absolute relative difference of scattering coefficients in each channel
     Cdif2 = abs(ref_abs_coef-abs_coef)# calculate absolute difference of absoprtion coefficients in each channel
 
     ## check if relative difference in scattering coefficient is within 20% for all and channels that the difference in absorption coefficient is within 1 Mm-1 for all channels
     a1 = ((Cdif1)<0.2).astype('int')#a1[np.isinf(a1)]=0
     a2 = ((Cdif2)<pow(10,-6)).astype('int')#
-    if np.sum(a1)==L2 & np.sum(a2)==L2:
+    if (np.sum(a1) == L2) and (np.sum(a2) == L2):
       iri[i1] = CRI_p[i1,1]
       rri[i1] = CRI_p[i1,0]
     ##    
@@ -136,12 +136,12 @@ def Retr_CRI(wvl_dict,
       scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
       abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1'] 
 
-    Cd1 = abs(ref_scat_coef-scat_coef)/ref_scat_coef
+    Cd1 = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
     Cd2 = abs(ref_abs_coef-abs_coef)
     a1 = ((Cd1)<0.2).astype('int')
     #a1[np.isinf(a1)]=0
     a2 = ((Cd2)<pow(10,-6)).astype('int')
-    if np.sum(a1)==L2 & np.sum(a2)==L2: #np.sum(a1)==L2 & np.sum(a2)==L2: # if solution is valid, store dry cri and dry calculated extinction, scattering, and absorption coefficients and SSA in all measured wavelengths
+    if (np.sum(a1) == L2) and (np.sum(a2) == L2): # if solution is valid, store dry cri and dry calculated extinction, scattering, and absorption coefficients and SSA in all measured wavelengths
       Results["dry_RRI_unitless"] = rri
       Results["dry_IRI_unitless"] = iri
       for i2 in range(L2):
@@ -264,7 +264,7 @@ def Retr_kappa(wvl_dict,
         scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
         ref_scat_coef[i2] = optical_measurements[f'wet_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
       ##  
-      Cdif = abs(ref_scat_coef-scat_coef)/ref_scat_coef # calculate absolute relative difference of scattering coefficients in each channel
+      Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10) # calculate absolute relative difference of scattering coefficients in each channel
       if np.all(Cdif<0.01): # solution is valid if scattering coefficients are within 1%
         Results["kappa_unitless"] = kappa_p[i1] # store retrieved kappa
         ## store calculated scattering and extinction coefficients and SSA for measured and validation wavelengths
