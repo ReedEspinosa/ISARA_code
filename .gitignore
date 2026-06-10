@@ -1,3 +1,4 @@
 build/
 reedAndClaudesNotes/
 ISARA_code.code-workspace
+*.pyc

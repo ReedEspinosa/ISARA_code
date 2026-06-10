@@ -98,6 +98,7 @@ The configuration file is a JSON file with the following structure:
   - **`wavelengths_nm`** (array of integers): List of wavelengths in nanometers
   - **`colors`** (array of strings): List of color names (must match length of wavelengths_nm)
   - If not needed, set to `null` or omit the field
+- **`overlap_priority`** (array of strings or null): Instrument names ordered from highest to lowest priority for resolving overlapping size coverage. Where two listed instruments overlap, bins of the lower-priority instrument whose midpoint diameter falls inside the higher-priority instrument's retained coverage are dropped. If omitted, the default is that **UHSAS and LAS each take precedence over SMPS** and all other instrument pairs are left untouched. Example: `"overlap_priority": ["LAS", "SMPS"]`
 
 ## Example Configuration Files
 
@@ -107,7 +108,7 @@ A template file `isara_config_template.json` is provided in the repository. You 
 
 1. **Size Bin Files**: The instrument names in the config file must match the CSV files in `./misc/{campaign_name}/SDBinInfo/`. For example, if you specify `"name": "SMPS"`, there must be a file like `SMPS_bins.csv` in that directory.
 
-2. **Size Cutoffs**: The `lower_bound_nm` and `upper_bound_nm` values should be chosen to avoid overlaps between instruments (to prevent double-counting) and gaps (to prevent underestimation). See `CODE_REVIEW_ISSUES.md` for details on this important consideration.
+2. **Size Cutoffs**: Set `lower_bound_nm` and `upper_bound_nm` to each instrument's *trusted* size range — overlapping cutoffs are now safe. Overlaps between instruments are resolved automatically (by default UHSAS/LAS bins are kept and SMPS bins inside their coverage are dropped; see `overlap_priority` above), and all retained bins are merged into a single sorted size grid passed to MOPSMAP as one mode, so dN/dlogDp is interpolated across any small gap between instruments instead of the gap contributing zero. True gaps in the merged grid are reported at startup; gaps larger than 25% in diameter trigger a stronger warning. See `CODE_REVIEW_ISSUES.md` issue 5 for background.
 
 3. **Wavelength Colors**: The color names are used in the output metadata for netCDF compliance. Common values are "Blue", "Green", "Red", but any string is acceptable.
 

@@ -10,6 +10,117 @@ from pathos.multiprocessing import ProcessPool
 
 HYGROSCOPIC_WVL_NM = 550
 
+# Default overlap-resolution rules (issue #5): where instruments overlap in bin
+# locations, bins of the lower-priority (loser) instrument are dropped. By
+# default the optical spectrometers UHSAS and LAS each take precedence over the
+# mobility-based SMPS; all other instrument pairs are left untouched. A config
+# file can override this with an "overlap_priority" list (highest first).
+DEFAULT_OVERLAP_RULES = [("UHSAS", "SMPS"), ("LAS", "SMPS")]
+DEFAULT_RANK_ORDER = ["UHSAS", "LAS"]
+
+def overlap_rules_from_priority(priority_list):
+    """Expand a highest-priority-first instrument list into (winner, loser) pairs."""
+    rules = []
+    for i, winner in enumerate(priority_list):
+        for loser in priority_list[i+1:]:
+            rules.append((winner, loser))
+    return rules
+
+def resolve_overlap(retained, dpg, dpl, dpu, rules):
+    """Drop lower-priority bins located inside a higher-priority instrument's coverage.
+
+    Parameters
+    ----------
+    retained : dict
+        Instrument name -> integer indices of the bins retained after the
+        cutoff filter.
+    dpg, dpl, dpu : dict
+        Instrument name -> full arrays of bin mid/lower/upper diameters (um).
+    rules : list of (winner, loser) tuples
+        For each rule, bins of `loser` whose midpoint diameter falls within
+        [min(dpl), max(dpu)] of the retained `winner` bins are removed.
+
+    Returns
+    -------
+    dict of instrument name -> trimmed integer index arrays.
+    """
+    out = {key: np.asarray(val, dtype=int) for key, val in retained.items()}
+    for winner, loser in rules:
+        if (winner not in out) or (loser not in out):
+            continue
+        widx = out[winner]
+        lidx = out[loser]
+        if (widx.size == 0) or (lidx.size == 0):
+            continue
+        lo = np.min(dpl[winner][widx])
+        hi = np.max(dpu[winner][widx])
+        keep = (dpg[loser][lidx] < lo) | (dpg[loser][lidx] > hi)
+        out[loser] = lidx[keep]
+    return out
+
+def merge_bins(retained, dpg, dpl, dpu, rank, sd=None):
+    """Concatenate retained bins of all instruments into one ascending size grid.
+
+    The merged grid is intended to be passed to MOPSMAP as a SINGLE mode, so
+    that dN/dlogDp is interpolated across any small gap between instruments
+    instead of the gap contributing exactly zero (issue #5a).
+
+    Parameters
+    ----------
+    retained : dict
+        Instrument name -> integer indices of the retained bins.
+    dpg, dpl, dpu : dict
+        Instrument name -> full bin arrays (um). May be per-row arrays (e.g.,
+        the aerodynamic-to-geometric shifted APS bins).
+    rank : dict
+        Instrument name -> integer rank (lower = higher priority); used only to
+        pick a winner when two instruments share the exact same dpg.
+    sd : dict, optional
+        Instrument name -> full concentration arrays; merged alongside if given.
+
+    Returns
+    -------
+    dict with parallel arrays 'dpg', 'dpl', 'dpu', 'inst', 'idx' (and 'sd' if
+    `sd` was given), sorted by ascending dpg with exact-duplicate diameters
+    removed (keeping the lowest-rank instrument's bin).
+    """
+    g_list, l_list, u_list, s_list, inst_list, idx_list, rank_list = [], [], [], [], [], [], []
+    for imode in retained:
+        ridx = np.asarray(retained[imode], dtype=int)
+        if ridx.size == 0:
+            continue
+        g_list.append(dpg[imode][ridx])
+        l_list.append(dpl[imode][ridx])
+        u_list.append(dpu[imode][ridx])
+        if sd is not None:
+            s_list.append(sd[imode][ridx])
+        inst_list.append(np.full(ridx.size, imode, dtype=object))
+        idx_list.append(ridx)
+        rank_list.append(np.full(ridx.size, rank.get(imode, len(rank)), dtype=int))
+    merged = {}
+    if len(g_list) == 0:
+        merged["dpg"] = np.array([])
+        merged["dpl"] = np.array([])
+        merged["dpu"] = np.array([])
+        merged["inst"] = np.array([], dtype=object)
+        merged["idx"] = np.array([], dtype=int)
+        if sd is not None:
+            merged["sd"] = np.array([])
+        return merged
+    g = np.concatenate(g_list)
+    r = np.concatenate(rank_list)
+    order = np.lexsort((r, g)) # ascending dpg; ties broken by priority rank
+    g = g[order]
+    keep = np.hstack(([True], g[1:] > g[:-1])) # drop exact-duplicate diameters
+    merged["dpg"] = g[keep]
+    merged["dpl"] = np.concatenate(l_list)[order][keep]
+    merged["dpu"] = np.concatenate(u_list)[order][keep]
+    merged["inst"] = np.concatenate(inst_list)[order][keep]
+    merged["idx"] = np.concatenate(idx_list)[order][keep]
+    if sd is not None:
+        merged["sd"] = np.concatenate(s_list)[order][keep]
+    return merged
+
 def interp_abs_at_wvl(abs_wvls, abs_values, target_wvl):
     """Log-log linear (Angstrom) interpolation of absorption to target_wvl.
     Nearest-neighbor extrapolation outside the range or when only one usable
@@ -119,7 +230,8 @@ def RunISARA(config_file=None):
     
     def handle_line(modelist, sd, dpg, dpu, dpl, UBcutoff, LBcutoff, measured_Sc_dry, measured_Abs_dry, RHsc, gamma,
                         dry_wvl, wet_wvl, val_wvl, size_equ, CRI_p, nonabs_fraction, shape,
-                        kappa_p, num_theta, rho_wet, path_optical_dataset, path_mopsmap_executable, full_dp):
+                        kappa_p, num_theta, rho_wet, path_optical_dataset, path_mopsmap_executable, full_dp,
+                        nominal_retained, required_modes, rank, grid_slot):
                     
         # So this code may look a bit funky, but we are doing what is called currying. This is simply the idea of returning a function inside of a function. 
         # It may look weird doing this, but this is actually required so that each worker has the necessary data. What ends up happening is each worker is 
@@ -180,87 +292,76 @@ def RunISARA(config_file=None):
             finalout['attempt_flag_CRI_unitless'] = 0
             finalout['attempt_flag_kappa_unitless'] = 0
             dpflg = 0
-            icount = 0
-            Dpg = {}
-            Dpu = {}
-            Dpl = {}  
-            Dndlogdp = {}
-            Size_equ = {}
-            Nonabs_fraction = {}
-            Shape = {}
-            Rho_dry = {}
-            Rho_wet = {}  
-            fullsd = None
-            fulldpg = None
-            fulldpu = None
-            fulldpl = None
+            row_retained = {}
+            row_dpg = {}
+            row_dpu = {}
+            row_dpl = {}
             for imode in sd:
-                icount += 1
-                if len(dpg[imode]) > 0:
-                    if imode == "APS":
-                        a = np.divide(dpl[imode],np.sqrt(rho_dry))
-                        b = np.divide(dpu[imode],np.sqrt(rho_dry))
-                        modeflg = np.where(np.logical_not(np.isnan(dndlogdp[imode]))&(a>=LBcutoff[imode])&(b<=UBcutoff[imode]))[0]
-                    else:
-                        modeflg = np.where(np.logical_not(np.isnan(dndlogdp[imode]))&(dpl[imode]>=LBcutoff[imode])&(dpu[imode]<=UBcutoff[imode]))[0]
-                    
-                    Dndlogdp[imode] = dndlogdp[imode][modeflg] 
-                    if len(Dndlogdp[imode]) > 0:
-                        dpflg += 1
-                        Size_equ[imode] = size_equ
-                        Nonabs_fraction[imode] = nonabs_fraction
-                        Shape[imode] = shape
-                        Rho_dry[imode] = rho_dry
-                        Rho_wet[imode] = rho_wet
-                        if imode == "APS":
-                            Dpg[imode] = np.divide(dpg[imode],np.sqrt(Rho_dry[imode]))[modeflg]
-                            Dpu[imode] = np.divide(dpu[imode],np.sqrt(Rho_dry[imode]))[modeflg]
-                            Dpl[imode] = np.divide(dpl[imode],np.sqrt(Rho_dry[imode]))[modeflg]
-                        else:
-                            Dpg[imode] = dpg[imode][modeflg]
-                            Dpu[imode] = dpu[imode][modeflg]
-                            Dpl[imode] = dpl[imode][modeflg]
-                        if dpflg == 1:
-                            fullsd = Dndlogdp[imode]
-                            fulldpg = Dpg[imode]
-                            fulldpu = Dpu[imode]
-                            fulldpl = Dpl[imode]
-                        else:
-                            fullsd = np.hstack((fullsd,Dndlogdp[imode]))
-                            fulldpg = np.hstack((fulldpg,Dpg[imode]))
-                            fulldpu = np.hstack((fulldpu,Dpu[imode]))
-                            fulldpl = np.hstack((fulldpl,Dpl[imode]))
-            if (dpflg==icount) & (measflg == 6):        
+                if len(dpg[imode]) == 0:
+                    row_retained[imode] = np.array([], dtype=int)
+                    continue
+                if imode == "APS":
+                    # APS bins are converted from aerodynamic to geometric diameter
+                    # with the row's effective density, so the cutoff test must use
+                    # the shifted bin edges each row.
+                    row_dpg[imode] = np.divide(dpg[imode],np.sqrt(rho_dry))
+                    row_dpu[imode] = np.divide(dpu[imode],np.sqrt(rho_dry))
+                    row_dpl[imode] = np.divide(dpl[imode],np.sqrt(rho_dry))
+                    row_retained[imode] = np.where(np.logical_not(np.isnan(dndlogdp[imode]))&(row_dpl[imode]>=LBcutoff[imode])&(row_dpu[imode]<=UBcutoff[imode]))[0]
+                else:
+                    row_dpg[imode] = dpg[imode]
+                    row_dpu[imode] = dpu[imode]
+                    row_dpl[imode] = dpl[imode]
+                    nom = nominal_retained[imode]
+                    row_retained[imode] = nom[np.logical_not(np.isnan(dndlogdp[imode][nom]))]
+                if (imode in required_modes) and (len(row_retained[imode]) > 0):
+                    dpflg += 1
+            # Merge all instruments into a SINGLE size grid (sorted by diameter,
+            # overlap-resolved at startup, lower-priority exact duplicates removed)
+            # that is passed to MOPSMAP as one mode, so dN/dlogDp is interpolated
+            # across any gap between instruments instead of the gap contributing
+            # zero (issue #5).
+            merged = merge_bins(row_retained, row_dpg, row_dpl, row_dpu, rank, sd=dndlogdp)
+            # Restrict the bins used in the retrieval to <= 2.5 um when the optical
+            # measurements are submicron-only (issue #6: no longer keyed to a stale
+            # loop variable; checks all instrument cutoffs).
+            merged_retr = merged
+            if (keycheck is not None) and ('submicron' in keycheck) and (max(UBcutoff.values()) > 2.5):
+                submicronfilter = np.where(merged["dpu"]<=2.5)[0]
+                merged_retr = {key: merged[key][submicronfilter] for key in merged}
+            if (dpflg == len(required_modes)) and (measflg == 2*Lwvl) and (len(merged_retr["dpg"]) > 0):
+                # map the row's bins onto the standardized output grid via their
+                # (instrument, bin index) labels; APS bins whose density-shifted
+                # location passes the cutoffs but is absent from the nominal grid
+                # are still used in the retrieval but have no output slot
                 full_sd = np.full(len(full_dp["dpg"]),np.nan)
                 full_dpl= np.full(len(full_dp["dpg"]),np.nan)
                 full_dpg = np.full(len(full_dp["dpg"]),np.nan)
-                full_dpu = np.full(len(full_dp["dpg"]),np.nan)          
+                full_dpu = np.full(len(full_dp["dpg"]),np.nan)
+                for j in range(len(merged["dpg"])):
+                    slot = grid_slot.get((merged["inst"][j], merged["idx"][j]))
+                    if slot is not None:
+                        full_sd[slot] = merged["sd"][j]
+                        full_dpl[slot] = merged["dpl"][j]
+                        full_dpg[slot] = merged["dpg"][j]
+                        full_dpu[slot] = merged["dpu"][j]
                 for idpg in range(len(full_dp["dpg"])):
-                    fulldpflg = np.where((fulldpg>=full_dp["dpl"][idpg])&(fulldpg<=full_dp["dpu"][idpg]))[0]
-                    if len(fulldpflg)>0:
-                        full_sd[idpg] = fullsd[fulldpflg]
-                        full_dpl[idpg] = fulldpl[fulldpflg]
-                        full_dpg[idpg] = fulldpg[fulldpflg]
-                        full_dpu[idpg] = fulldpu[fulldpflg]
-                for idpg in range(len(full_dp["dpg"])):
-                    finalout[f'dndlogdp_bin{idpg}_m-3'] = full_sd[idpg]       
+                    finalout[f'dndlogdp_bin{idpg}_m-3'] = full_sd[idpg]
                     finalout[f'dpl_bin{idpg}_um'] = full_dpl[idpg]
                     finalout[f'dpg_bin{idpg}_um'] = full_dpg[idpg]
-                    finalout[f'dpu_bin{idpg}_um'] = full_dpu[idpg]          
+                    finalout[f'dpu_bin{idpg}_um'] = full_dpu[idpg]
 
-                #measflg = np.where((np.logical_not(np.isnan(meas_coef))&(meas_coef>10**(-6))))[0]
-                #print(len(meas_coef))
                 finalout['attempt_flag_CRI_unitless'] = 1
-                if (keycheck.__contains__('submicron')&(UBcutoff[imode]>2.5)):
-                    for imode in Dpg:
-                        submicronfilter = np.where(Dpu[imode]<=2.5)[0]
-                        Dndlogdp[imode]= Dndlogdp[imode][submicronfilter]
-                        Dpg[imode] = Dpg[imode][submicronfilter]
-                        Dpl[imode] = Dpl[imode][submicronfilter]
-                        Dpu[imode] = Dpu[imode][submicronfilter]    
+                Dndlogdp = {"merged": merged_retr["sd"]}
+                Dpg = {"merged": merged_retr["dpg"]}
+                Size_equ = {"merged": size_equ}
+                Nonabs_fraction = {"merged": nonabs_fraction}
+                Shape = {"merged": shape}
+                Rho_dry = {"merged": rho_dry}
+                Rho_wet = {"merged": rho_wet}
 
-                Results = ISARA.Retr_CRI(dry_wvl, val_wvl, finalout, Dndlogdp, Dpg, CRI_p, Size_equ, 
-                    Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable)    
+                Results = ISARA.Retr_CRI(dry_wvl, val_wvl, finalout, Dndlogdp, Dpg, CRI_p, Size_equ,
+                    Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable)
 
                 if Results["dry_RRI_unitless"] is not None:
                     finalout['attempt_flag_CRI_unitless'] = 2
@@ -296,20 +397,20 @@ def RunISARA(config_file=None):
                                     finalout[f'wet_cal_SSA_{val_wvl[i2]}_unitless'] = np.nan
                                     finalout[f'wet_cal_ext_coef_{val_wvl[i2]}_m-1'] = np.nan                                     
                     else:
-                        finalout["dry_RRI_unitless"] = np.nan
-                        finalout["dry_IRI_unitless"] = np.nan
-                        for i2 in range(Lwvl):
-                            finalout[f'dry_cal_sca_coef_{dry_wvl["sca"][i2]}_m-1'] = np.nan
-                            finalout[f'dry_cal_abs_coef_{dry_wvl["abs"][i2]}_m-1'] = np.nan
-                            finalout[f'dry_cal_SSA_{dry_wvl["sca"][i2]}_unitless'] = np.nan
-                            finalout[f'dry_cal_SSA_{dry_wvl["abs"][i2]}_unitless'] = np.nan
-                            finalout[f'dry_cal_ext_coef_{dry_wvl["sca"][i2]}_m-1'] = np.nan
-                            finalout[f'dry_cal_ext_coef_{dry_wvl["abs"][i2]}_m-1'] = np.nan
+                        # wet measurement missing (e.g., gamma or RH_Sc is NaN): keep the
+                        # retrieved dry CRI and dry_cal outputs (issue #18) and only mark
+                        # the kappa/wet outputs as unavailable
+                        finalout[f'cal_fRH_{HYGROSCOPIC_WVL_NM}_unitless'] = np.nan
+                        finalout[f'kappa_unitless'] = np.nan
+                        for i2 in range(len(wet_wvl["sca"])):
+                            finalout[f'wet_cal_sca_coef_{wet_wvl["sca"][i2]}_m-1'] = np.nan
+                            finalout[f'wet_cal_SSA_{wet_wvl["sca"][i2]}_unitless'] = np.nan
+                            finalout[f'wet_cal_ext_coef_{wet_wvl["sca"][i2]}_m-1'] = np.nan
                         if val_wvl is not None:
                             for i2 in range(len(val_wvl)):
-                                finalout[f'dry_cal_sca_coef_{val_wvl[i2]}_m-1'] = np.nan
-                                finalout[f'dry_cal_SSA_{val_wvl[i2]}_unitless'] = np.nan
-                                finalout[f'dry_cal_ext_coef_{val_wvl[i2]}_m-1'] = np.nan                       
+                                finalout[f'wet_cal_sca_coef_{val_wvl[i2]}_m-1'] = np.nan
+                                finalout[f'wet_cal_SSA_{val_wvl[i2]}_unitless'] = np.nan
+                                finalout[f'wet_cal_ext_coef_{val_wvl[i2]}_m-1'] = np.nan
                 else:
                     finalout["dry_RRI_unitless"] = np.nan
                     finalout["dry_IRI_unitless"] = np.nan
@@ -391,18 +492,9 @@ def RunISARA(config_file=None):
     #wvl = [0.450, 0.465, 0.520, 0.550, 0.640, 0.700] 
     size_equ = 'cs' 
 
-    RRIp = np.arange(1.51,1.55,0.01).reshape(-1)#np.arange(1.5,1.6,0.02).reshape(-1)#np.array([1.53])#np.arange(1.45,2.01,0.01).reshape(-1)
-    IRIp = np.hstack((0,10**(-7),10**(-6),10**(-5),10**(-4),np.arange(0.001,0.081,0.001).reshape(-1)))
-    #np.hstack((0,10**(-7),10**(-6),10**(-5),10**(-4),np.arange(0.001,0.101,0.001).reshape(-1),np.arange(0.1,0.96,0.01).reshape(-1)))
-    #np.arange(0.0,0.08,0.001).reshape(-1)
-    CRI_p = np.empty((len(IRIp)*len(RRIp), 2))
-    io = 0
-    for i1 in range(len(IRIp)):
-        for i2 in range(len(RRIp)):
-            CRI_p[io, :] = [RRIp[i2], IRIp[i1]]
-            io += 1 
+    CRI_p = ISARA.default_CRI_grid()
 
-    kappa_p = np.arange(0.0, 1.40, 0.001).reshape(-1)  
+    kappa_p = ISARA.default_kappa_grid()
 
     # set the non-absorbing fraction of the aerosol SD
     nonabs_fraction = 0 
@@ -505,11 +597,6 @@ def RunISARA(config_file=None):
     dpg = {}
     dpu = {}
     dpl = {}
-    maxdpglength = 0
-    full_dp = {}
-    full_dp["dpg"] = None
-    full_dp["dpu"] = None
-    full_dp["dpl"] = None
     for i1 in range(nummodes):
         keyname = modelist[i1]
         if config is None:
@@ -518,22 +605,63 @@ def RunISARA(config_file=None):
             modelist[i1] = keyname
             UBcutoff[keyname] = float(input(f"Enter the upper bound of particle sizes\nfor {keyname} data in nm (e.g., 125): "))*pow(10,-3)
             LBcutoff[keyname] = float(input(f"Enter the lower bound of particle sizes\nfor {keyname} data in nm (e.g., 10): "))*pow(10,-3)
-        
+
         ifn = [f for f in os.listdir(f'./misc/{DN}/SDBinInfo/') if f.__contains__(keyname)]
         dpData = load_sizebins.Load(f'./misc/{DN}/SDBinInfo/{ifn[0]}')
-        dpg[keyname] = grab_data(dpData,"Mid Points")*pow(10,-3) 
-        dpu[keyname] = grab_data(dpData,"Upper Bounds")*pow(10,-3) 
-        dpl[keyname] = grab_data(dpData,"Lower Bounds")*pow(10,-3) 
-        dpcutoffflg = np.where((dpl[keyname]>=LBcutoff[keyname])&(dpu[keyname]<=UBcutoff[keyname]))[0]
-        maxdpglength += len(dpcutoffflg)
-        if i1 == 0:
-            full_dp["dpg"] = dpg[keyname][dpcutoffflg]
-            full_dp["dpu"] = dpu[keyname][dpcutoffflg]
-            full_dp["dpl"] = dpl[keyname][dpcutoffflg]
-        else:
-            full_dp["dpg"] = np.hstack((full_dp["dpg"],dpg[keyname][dpcutoffflg]))
-            full_dp["dpu"] = np.hstack((full_dp["dpu"],dpu[keyname][dpcutoffflg]))
-            full_dp["dpl"] = np.hstack((full_dp["dpl"],dpl[keyname][dpcutoffflg]))
+        dpg[keyname] = grab_data(dpData,"Mid Points")*pow(10,-3)
+        dpu[keyname] = grab_data(dpData,"Upper Bounds")*pow(10,-3)
+        dpl[keyname] = grab_data(dpData,"Lower Bounds")*pow(10,-3)
+
+    # Overlap priority: bins of a lower-priority instrument that fall inside a
+    # higher-priority instrument's retained coverage are dropped (issue #5).
+    if (config is not None) and (config.get("overlap_priority") is not None):
+        overlap_rules = overlap_rules_from_priority(config["overlap_priority"])
+        rank_order = list(config["overlap_priority"])
+    else:
+        overlap_rules = list(DEFAULT_OVERLAP_RULES)
+        rank_order = list(DEFAULT_RANK_ORDER)
+    rank = {}
+    for name in rank_order:
+        if name not in rank:
+            rank[name] = len(rank)
+    for name in modelist:
+        if name not in rank:
+            rank[name] = len(rank)
+
+    # Cutoff validation and nominal (instrument bin table) retained-bin sets
+    nominal_retained = {}
+    for keyname in modelist:
+        if LBcutoff[keyname] >= UBcutoff[keyname]:
+            raise ValueError(f"{keyname}: lower_bound ({LBcutoff[keyname]} um) must be smaller than upper_bound ({UBcutoff[keyname]} um).")
+        nominal_retained[keyname] = np.where((dpl[keyname]>=LBcutoff[keyname])&(dpu[keyname]<=UBcutoff[keyname]))[0]
+        if len(nominal_retained[keyname]) == 0:
+            print(f"WARNING: no {keyname} bins fall within its size cutoffs; {keyname} will not contribute to the retrievals.")
+    nominal_retained = resolve_overlap(nominal_retained, dpg, dpl, dpu, overlap_rules)
+    for keyname in modelist:
+        if (len(nominal_retained[keyname]) == 0) and (len(np.where((dpl[keyname]>=LBcutoff[keyname])&(dpu[keyname]<=UBcutoff[keyname]))[0]) > 0):
+            print(f"WARNING: all {keyname} bins lie inside higher-priority instrument coverage and were dropped; {keyname} will not contribute to the retrievals.")
+    # Instruments that must contribute at least one valid bin in a given row for
+    # the retrieval to be attempted (those with no nominal bins are excluded).
+    required_modes = [keyname for keyname in modelist if len(nominal_retained[keyname]) > 0]
+
+    # Standardized output grid: merged, sorted by diameter, overlap-free, with
+    # (instrument, bin index) labels mapping each grid slot to its source bin.
+    full_dp = merge_bins(nominal_retained, dpg, dpl, dpu, rank)
+    if len(full_dp["dpg"]) == 0:
+        raise ValueError("No size distribution bins remain after applying cutoffs and overlap resolution.")
+    grid_slot = {(full_dp["inst"][i], full_dp["idx"][i]): i for i in range(len(full_dp["dpg"]))}
+
+    # Warn about true gaps in the merged grid. Because the merged grid is passed
+    # to MOPSMAP as a single mode, dN/dlogDp is linearly interpolated between
+    # the bin midpoints spanning each gap (instead of the gap contributing zero
+    # as it did when each instrument was a separate MOPSMAP mode).
+    for i in range(len(full_dp["dpg"])-1):
+        if full_dp["dpl"][i+1] > full_dp["dpu"][i]:
+            msg = (f"NOTE: gap in merged size grid from {full_dp['dpu'][i]:.4f} to {full_dp['dpl'][i+1]:.4f} um "
+                   f"({full_dp['inst'][i]} -> {full_dp['inst'][i+1]}); MOPSMAP will interpolate dN/dlogDp across it.")
+            if full_dp["dpl"][i+1]/full_dp["dpu"][i] > 1.25:
+                msg += " WARNING: this gap exceeds 25% in diameter; the interpolated contribution may be significant."
+            print(msg)
     IFN = [f for f in os.listdir(f'./misc/{DN}/{data_directory}/') if f.endswith('.ict')]
     #b = np.array([39,126,138,169,170,171]).astype(int)#39,126,138,169,170,171
     #b = range(15,39,1)
@@ -716,9 +844,10 @@ def RunISARA(config_file=None):
             # for the first line of data
             line_data = pool.map(
                 # This is a pain, I know, but all the data has to be cloned and accessible within each worker
-                handle_line(modelist, sd, dpg, dpu, dpl, UBcutoff, LBcutoff, Sc, Abs, RHsc, gamma, 
+                handle_line(modelist, sd, dpg, dpu, dpl, UBcutoff, LBcutoff, Sc, Abs, RHsc, gamma,
                             dry_wvl, wet_wvl, val_wvl, size_equ, CRI_p, nonabs_fraction, shape,
-                            kappa_p, num_theta, rho_wet, path_optical_dataset, path_mopsmap_executable, full_dp),
+                            kappa_p, num_theta, rho_wet, path_optical_dataset, path_mopsmap_executable, full_dp,
+                            nominal_retained, required_modes, rank, grid_slot),
                 range(L1),
             )
 
