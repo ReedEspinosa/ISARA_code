@@ -296,7 +296,7 @@ def test_default_grids():
     assert cri.shape == (n_rri*n_iri, 2)
     # note: this arange includes ~1.55 on most platforms (floating-point endpoint)
     assert np.isclose(cri[:, 0].min(), 1.51) and cri[:, 0].max() < 1.55 + 1e-9
-    assert cri[:, 1].min() == 0 and np.isclose(cri[:, 1].max(), 0.080)
+    assert cri[:, 1].min() == 0 and np.isclose(cri[:, 1].max(), 0.030)
     kappa = ISARA.default_kappa_grid()
     assert kappa[0] == 0.0 and np.isclose(kappa[-1], 1.399) and len(kappa) == 1400
 

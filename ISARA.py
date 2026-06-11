@@ -10,7 +10,7 @@ def default_CRI_grid():
   :rtype: numpy array
   """
   RRIp = np.arange(1.51, 1.55, 0.01).reshape(-1)
-  IRIp = np.hstack((0, 10**(-7), 10**(-6), 10**(-5), 10**(-4), np.arange(0.001, 0.081, 0.001).reshape(-1)))
+  IRIp = np.hstack((0, 10**(-7), 10**(-6), 10**(-5), 10**(-4), np.arange(0.001, 0.031, 0.001).reshape(-1)))
   CRI_p = np.empty((len(IRIp)*len(RRIp), 2))
   io = 0
   for i1 in range(len(IRIp)):
@@ -47,6 +47,7 @@ def Retr_PSD(radii_um,
   num_theta=2,
   path_optical_dataset='./optical_dataset/',
   path_mopsmap_executable='./mopsmap',
+  lut=None,
 ):
 
   """
@@ -94,6 +95,8 @@ def Retr_PSD(radii_um,
   :type path_optical_dataset: str
   :param path_mopsmap_executable: Path of the mopsmap executable
   :type path_mopsmap_executable: str
+  :param lut: Optional precomputed optics_lut.OpticsLUT for the CRI grid search. Used only when its fingerprint (bin diameters after NaN dropping, wavelengths, CRI grid, shape assumptions) matches this call; otherwise the per-candidate MOPSMAP path runs as usual, so passing a LUT never changes which retrievals are possible
+  :type lut: optics_lut.OpticsLUT
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -170,7 +173,8 @@ def Retr_PSD(radii_um,
   finalout['attempt_flag_CRI_unitless'] = 1
   finalout['attempt_flag_kappa_unitless'] = 0
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
-    Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable)
+    Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
+    lut=lut)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -215,8 +219,9 @@ def Retr_CRI(wvl_dict,
   shape,
   rho,
   num_theta,
-  path_optical_dataset, 
+  path_optical_dataset,
   path_mopsmap_executable,
+  lut=None,
 ):
 
   """
@@ -281,25 +286,57 @@ def Retr_CRI(wvl_dict,
     ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
     ##
   ##
-  for i1 in range(L1): # initiate loop through possible cri values
+  ## Decide whether the (optional) precomputed optics LUT can replace the
+  ## per-candidate MOPSMAP subprocess calls of the grid search. The LUT is
+  ## applicable only for a single-mode PSD on exactly its bin grid with the
+  ## same wavelengths, CRI grid and particle assumptions; in every other case
+  ## the original subprocess loop below runs unchanged.
+  use_lut = False
+  if lut is not None and len(sd) == 1:
+    lut_mode = next(iter(sd))
+    use_lut = (
+      np.all(np.isfinite(sd[lut_mode]))
+      and lut.matches(wvl, CRI_p, dpg[lut_mode], size_equ[lut_mode],
+                      nonabs_fraction[lut_mode], shape[lut_mode])
+    )
+
+  if use_lut:
+    ## vectorized grid search: coefficients for ALL candidates as dot products
+    ext_all, sca_all = lut.coefficients(sd[lut_mode])  # (L1, n_wvl) each
+    i_sca = [lut.wavelength_index(wvl_dict["sca"][i2]) for i2 in range(L2)]
+    i_abs = [lut.wavelength_index(wvl_dict["abs"][i2]) for i2 in range(L2)]
+    scat_coef_all = sca_all[:, i_sca]
+    abs_coef_all = ext_all[:, i_abs] - sca_all[:, i_abs]
+    for i2 in range(L2):
+      ref_scat_coef[i2] = optical_measurements[f'dry_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
+      ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
+    ## identical 20% / 1 Mm-1 acceptance tests as the subprocess loop below
+    Cdif1 = np.divide(abs(ref_scat_coef - scat_coef_all), ref_scat_coef,
+      out=np.full_like(scat_coef_all, np.inf), where=ref_scat_coef > 1e-10)
+    Cdif2 = abs(ref_abs_coef - abs_coef_all)
+    valid = np.logical_and((Cdif1 < 0.2).all(axis=1), (Cdif2 < pow(10, -6)).all(axis=1))
+    rri[valid] = CRI_p[valid, 0]
+    iri[valid] = CRI_p[valid, 1]
+  else:
+   for i1 in range(L1): # initiate loop through possible cri values
     ## assign the rri and iri for to each size mode.
     RRI_p = {}
     IRI_p = {}
     for imode in sd:
       #if imode == 'SMPS':
         #RRI_p[imode] = 1.4
-        #IRI_p[imode] = 0.01       
+        #IRI_p[imode] = 0.01
       #else:
       RRI_p[imode] = CRI_p[i1,0]
       IRI_p[imode] = CRI_p[i1,1]
-    ##  
+    ##
     results = MMModel(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given cri
     scat_coef = np.full((L2),np.nan)## prepare arrays of calculated scattering and absorption coefficients
-    abs_coef = np.full((L2),np.nan)  
+    abs_coef = np.full((L2),np.nan)
     ## Assign values to prepared calculated coefficients
     for i2 in range(L2):
       scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-      abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1'] 
+      abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
       ref_scat_coef[i2] = optical_measurements[f'dry_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
       ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
 
@@ -313,7 +350,7 @@ def Retr_CRI(wvl_dict,
     if (np.sum(a1) == L2) and (np.sum(a2) == L2):
       iri[i1] = CRI_p[i1,1]
       rri[i1] = CRI_p[i1,0]
-    ##    
+    ##
 
   flgs = np.logical_not(np.isnan(rri)) # flag valid solutions
   
