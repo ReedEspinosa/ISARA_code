@@ -2,3 +2,6 @@ build/
 reedAndClaudesNotes/
 ISARA_code.code-workspace
 *.pyc
+mopsmap
+optical_dataset
+tmp_mopsmap_*
