@@ -2,14 +2,16 @@ import mopsmap_wrapper
 MMModel = mopsmap_wrapper.Model
 import numpy as np
 
-def default_CRI_grid():
+def default_CRI_grid(rri_min=1.51, rri_max=1.54, rri_step=0.01):
   """
   Returns the default grid of candidate complex refractive index (CRI) values searched by Retr_CRI.
+  The RRI range is parameterizable (defaults preserve the historical 1.51-1.54 grid); the IRI
+  grid is fixed at 0, 1e-7..1e-4 decades, then 0.001-0.030 in 0.001 steps.
 
   :return: 2-D array of shape (N, 2) where column 0 is RRI and column 1 is IRI
   :rtype: numpy array
   """
-  RRIp = np.arange(1.51, 1.55, 0.01).reshape(-1)
+  RRIp = np.arange(rri_min, rri_max + rri_step/2.0, rri_step).reshape(-1)
   IRIp = np.hstack((0, 10**(-7), 10**(-6), 10**(-5), 10**(-4), np.arange(0.001, 0.031, 0.001).reshape(-1)))
   CRI_p = np.empty((len(IRIp)*len(RRIp), 2))
   io = 0
@@ -402,9 +404,14 @@ def Retr_CRI(wvl_dict,
   
   #pause()
   #print(ref_abs_coef*10**6,abs_coef*10**6,'\n')
-  if np.sum(rri[flgs])>0: # check to see if any valid solutions exist 
-    ## take mean rri and iri of all valid solutions and recalculate aerosol properties with mean cri values.    
-    rri = np.mean(rri[flgs]) 
+  if np.sum(rri[flgs])>0: # check to see if any valid solutions exist
+    ## record the size and spread of the accepted-candidate set (retrieval
+    ## uncertainty proxy; the reported CRI is the mean of these candidates)
+    Results["dry_CRI_n_accepted_unitless"] = int(np.sum(flgs))
+    Results["dry_RRI_accepted_std_unitless"] = float(np.std(rri[flgs]))
+    Results["dry_IRI_accepted_std_unitless"] = float(np.std(iri[flgs]))
+    ## take mean rri and iri of all valid solutions and recalculate aerosol properties with mean cri values.
+    rri = np.mean(rri[flgs])
     iri = np.mean(iri[flgs])
     RRI_d = {}
     IRI_d = {}
