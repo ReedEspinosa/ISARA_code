@@ -28,6 +28,17 @@ def default_kappa_grid():
   """
   return np.arange(0.0, 1.40, 0.001).reshape(-1)
 
+def _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl):
+  """Sorted union (nm, int) of every wavelength the retrieval should report."""
+  wl = list(wvl_dry["sca"]) + list(wvl_dry["abs"])
+  if wvl_wet is not None:
+    wl += list(wvl_wet["sca"])
+  if val_wvl is not None:
+    wl += list(np.asarray(val_wvl).astype(int))
+  if out_wvl is not None:
+    wl += list(np.asarray(out_wvl).astype(int))
+  return sorted(set(int(x) for x in wl))
+
 def Retr_PSD(radii_um,
   dndlogdp_cm3,
   dry_sca_coef,
@@ -36,9 +47,11 @@ def Retr_PSD(radii_um,
   wet_sca_coef=None,
   wet_wvl=None,
   RH_wet=80,
+  RH_ambient=None,
   CRI_p=None,
   kappa_p=None,
   val_wvl=None,
+  out_wvl=None,
   size_equ='cs',
   nonabs_fraction=0,
   shape='sphere',
@@ -73,6 +86,13 @@ def Retr_PSD(radii_um,
   :type wet_wvl: dict
   :param RH_wet: Percent relative humidity of the humidified scattering measurement (default 80)
   :type RH_wet: double
+  :param RH_ambient: Optional ambient percent relative humidity; when finite (and < 100) and the
+    kappa retrieval succeeds, the humidified state is also forward-calculated at this RH and
+    reported under 'amb_cal_*' keys (plus 'amb_gf/RRI/IRI_unitless' and 'RH_ambient_percent')
+  :type RH_ambient: double
+  :param out_wvl: Optional array of wavelengths (nm) at which the full dry/wet/ambient optical
+    set is reported, in addition to the measured and validation wavelengths
+  :type out_wvl: numpy array
   :param CRI_p: Optional 2-D array of candidate (RRI, IRI) pairs; defaults to default_CRI_grid()
   :type CRI_p: numpy array
   :param kappa_p: Optional 1-D array of candidate kappa values; defaults to default_kappa_grid()
@@ -180,6 +200,15 @@ def Retr_PSD(radii_um,
   cri_success = Results["dry_RRI_unitless"] is not None
   if cri_success:
     finalout['attempt_flag_CRI_unitless'] = 2
+    ## complete the dry optical set: derive sca/abs from ext and SSA at every
+    ## wavelength where the CRI search reported them (sca channels lack abs
+    ## and vice versa); setdefault never overwrites a directly stored value
+    for w in _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl):
+      ext = finalout.get(f'dry_cal_ext_coef_{w}_m-1')
+      ssa = finalout.get(f'dry_cal_SSA_{w}_unitless')
+      if ext is not None and ssa is not None:
+        finalout.setdefault(f'dry_cal_sca_coef_{w}_m-1', ssa*ext)
+        finalout.setdefault(f'dry_cal_abs_coef_{w}_m-1', (1.0-ssa)*ext)
 
   ## kappa retrieval if humidified scattering is supplied and the dry CRI was retrieved
   if wet_sca is not None:
@@ -201,6 +230,23 @@ def Retr_PSD(radii_um,
         finalout[key] = KResults[key]
       if KResults["kappa_unitless"] is not None:
         finalout['attempt_flag_kappa_unitless'] = 2
+        ## report the full humidified state (all output wavelengths, humidified
+        ## CRI, growth factor) at the retrieval RH, and optionally at ambient RH
+        kappa_ret = KResults["kappa_unitless"]
+        all_wvl = _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl)
+        states = [("wet", RH_wet)]
+        if RH_ambient is not None and np.isfinite(RH_ambient) and 0 < RH_ambient < 100:
+          states.append(("amb", RH_ambient))
+          finalout['RH_ambient_percent'] = float(RH_ambient)
+        for tag, rh_state in states:
+          hum = humidified_optics(sd, dpg, CRI_dry, kappa_ret, rh_state, all_wvl,
+            Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
+            path_optical_dataset, path_mopsmap_executable)
+          for gkey in ("gf_unitless", "RRI_unitless", "IRI_unitless"):
+            finalout[f'{tag}_{gkey}'] = hum[gkey]
+          for key, value in hum.items():
+            if key.startswith(("sca_coef_", "abs_coef_", "ext_coef_", "SSA_")):
+              finalout[f'{tag}_cal_{key}'] = value
 
   ## failed/unattempted retrievals are reported as NaN
   for key in finalout:
@@ -526,3 +572,64 @@ def Retr_kappa(wvl_dict,
         ##        
         stop_indx = 1 # change stop index when first valid solution is reached
   return Results # return dictionary (Results) of kappa and wet calculated extinction, scattering, and absorption coefficients and SSA in all measured and validation wavelengths
+
+def humidified_optics(sd,
+  dpg,
+  CRI_d,
+  kappa,
+  RH,
+  wvl,
+  size_equ,
+  nonabs_fraction,
+  shape,
+  rho,
+  num_theta,
+  path_optical_dataset,
+  path_mopsmap_executable,
+):
+  """
+  Forward-calculate humidified optical properties at an arbitrary relative humidity.
+
+  Grows the dry PSD by the kappa-Kohler growth factor gf = (1 + kappa*RH/(100-RH))^(1/3),
+  mixes the dry CRI with water (RRI 1.33, IRI 0) by volume, and runs MOPSMAP at the
+  requested wavelengths. This is the same humidification model used inside Retr_kappa,
+  exposed so callers can compute the humidified state at any RH (e.g. ambient) and any
+  wavelength set from an already-retrieved dry CRI and kappa.
+
+  :param sd: Dictionary of modal size resolved number concentrations in m^-3
+  :param dpg: Dictionary of DRY modal geometric mean bin diameters in micrometer
+  :param CRI_d: Array [RRI_dry, IRI_dry]
+  :param kappa: Retrieved (or assumed) hygroscopicity parameter
+  :param RH: Percent relative humidity of the humidified state (must be < 100)
+  :param wvl: Array of output wavelengths in nm
+  :return: Dictionary with 'gf_unitless', 'RRI_unitless', 'IRI_unitless' (humidified CRI)
+    and per-wavelength 'sca_coef_{w}_m-1', 'abs_coef_{w}_m-1', 'ext_coef_{w}_m-1',
+    'SSA_{w}_unitless'
+  :rtype: dict
+  """
+  wvl = np.unique(np.asarray(wvl).astype(int))
+  gf = np.power((1 + kappa * RH / (100 - RH)), 1/3)
+  RRIw = 1.33 # rri of water
+  IRIw = 0.0 # iri of water
+  dpg_w = {}
+  RRI_w = {}
+  IRI_w = {}
+  for imode in sd:
+    dpg_w[imode] = np.squeeze(np.multiply(gf, dpg[imode]))
+    RRI_w[imode] = (CRI_d[0]+((gf**3)-1)*RRIw)/(gf**3) # volume weighted humidified rri
+    IRI_w[imode] = (CRI_d[1]+((gf**3)-1)*IRIw)/(gf**3) # volume weighted humidified iri
+  results = MMModel(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+  first_mode = next(iter(sd))
+  out = {
+    "gf_unitless": float(gf),
+    "RRI_unitless": float(RRI_w[first_mode]),
+    "IRI_unitless": float(IRI_w[first_mode]),
+  }
+  for w in wvl:
+    ext = results[f'ext_coeff_{w}_m-1']
+    ssa = results[f'ssa_{w}']
+    out[f'sca_coef_{w}_m-1'] = ssa*ext
+    out[f'abs_coef_{w}_m-1'] = (1.0-ssa)*ext
+    out[f'ext_coef_{w}_m-1'] = ext
+    out[f'SSA_{w}_unitless'] = ssa
+  return out
