@@ -64,6 +64,7 @@ def Retr_PSD(radii_um,
   path_mopsmap_executable='./mopsmap',
   lut=None,
   forward_engine='mopsmap',
+  estimator='linf-mean',
 ):
 
   """
@@ -125,6 +126,16 @@ def Retr_PSD(radii_um,
     mopsmap_sphere_table/ -- ~100x faster, spheres only, validated to <=0.21% vs exact Mie).
     All retrieval logic (grids, acceptance criteria, estimator) is engine-independent.
   :type forward_engine: str
+  :param estimator: Solution selection for both the CRI grid search and the kappa scan.
+    'linf-mean' (default, historical): CRI = mean of candidates with ALL channels inside
+    tolerance (20% sca, 1 Mm-1 abs; re-verified at the mean); kappa = first grid value with
+    all humidified channels within 1%. 'chi2-wmean': Gaussian-posterior weighted mean over
+    the grid with sigma equal to those same tolerances, success gate min reduced chi^2 <= 1;
+    adds dry_CRI_min_chi2 / kappa_min_chi2 / kappa_std outputs, and the *_accepted_std
+    outputs become posterior-weighted stds. Best RMSE and ~+30% more successful retrievals
+    in the ASCENT-ACP estimator study (scripts/estimator_study.py, 2026-08-31); evaluates
+    the full kappa grid, so pair it with forward_engine='table'.
+  :type estimator: str
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -211,7 +222,7 @@ def Retr_PSD(radii_um,
   finalout['attempt_flag_kappa_unitless'] = 0
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
     Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
-    lut=lut, model=model)
+    lut=lut, model=model, estimator=estimator)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -242,7 +253,8 @@ def Retr_PSD(radii_um,
       CRI_dry = np.array([Results["dry_RRI_unitless"], Results["dry_IRI_unitless"]])
       KResults = Retr_kappa(wvl_wet, val_wvl, optical_measurements, sd, dpg, RH_wet, kappa_p,
         CRI_dry, Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
-        path_optical_dataset, path_mopsmap_executable, model=model)
+        path_optical_dataset, path_mopsmap_executable, model=model,
+        estimator=estimator)
       for key in KResults:
         finalout[key] = KResults[key]
       if KResults["kappa_unitless"] is not None:
@@ -286,6 +298,7 @@ def Retr_CRI(wvl_dict,
   path_mopsmap_executable,
   lut=None,
   model=None,
+  estimator='linf-mean',
 ):
 
   """
@@ -366,6 +379,8 @@ def Retr_CRI(wvl_dict,
                       nonabs_fraction[lut_mode], shape[lut_mode])
     )
 
+  scat_coef_all = np.full((L1, L2), np.nan)
+  abs_coef_all = np.full((L1, L2), np.nan)
   if use_lut:
     ## vectorized grid search: coefficients for ALL candidates as dot products
     ext_all, sca_all = lut.coefficients(sd[lut_mode])  # (L1, n_wvl) each
@@ -373,107 +388,96 @@ def Retr_CRI(wvl_dict,
     i_abs = [lut.wavelength_index(wvl_dict["abs"][i2]) for i2 in range(L2)]
     scat_coef_all = sca_all[:, i_sca]
     abs_coef_all = ext_all[:, i_abs] - sca_all[:, i_abs]
-    for i2 in range(L2):
-      ref_scat_coef[i2] = optical_measurements[f'dry_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
-      ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
-    ## identical 20% / 1 Mm-1 acceptance tests as the subprocess loop below
-    Cdif1 = np.divide(abs(ref_scat_coef - scat_coef_all), ref_scat_coef,
-      out=np.full_like(scat_coef_all, np.inf), where=ref_scat_coef > 1e-10)
-    Cdif2 = abs(ref_abs_coef - abs_coef_all)
-    valid = np.logical_and((Cdif1 < 0.2).all(axis=1), (Cdif2 < pow(10, -6)).all(axis=1))
-    rri[valid] = CRI_p[valid, 0]
-    iri[valid] = CRI_p[valid, 1]
   else:
-   for i1 in range(L1): # initiate loop through possible cri values
-    ## assign the rri and iri for to each size mode.
+   for i1 in range(L1): # loop through possible cri values; store per-candidate coefficients
     RRI_p = {}
     IRI_p = {}
     for imode in sd:
-      #if imode == 'SMPS':
-        #RRI_p[imode] = 1.4
-        #IRI_p[imode] = 0.01
-      #else:
       RRI_p[imode] = CRI_p[i1,0]
       IRI_p[imode] = CRI_p[i1,1]
-    ##
-    results = model(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given cri
-    scat_coef = np.full((L2),np.nan)## prepare arrays of calculated scattering and absorption coefficients
-    abs_coef = np.full((L2),np.nan)
-    ## Assign values to prepared calculated coefficients
+    results = model(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     for i2 in range(L2):
-      scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-      abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
-      ref_scat_coef[i2] = optical_measurements[f'dry_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
-      ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
+      scat_coef_all[i1, i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+      abs_coef_all[i1, i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
 
-    ##
-    Cdif1 = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10) # calculate absolute relative difference of scattering coefficients in each channel
-    Cdif2 = abs(ref_abs_coef-abs_coef)# calculate absolute difference of absoprtion coefficients in each channel
+  ## shared misfit measures for both estimators (identical tolerances:
+  ## 20% relative per sca channel, 1 Mm-1 absolute per abs channel)
+  Cdif1 = np.divide(abs(ref_scat_coef - scat_coef_all), ref_scat_coef,
+    out=np.full_like(scat_coef_all, np.inf), where=ref_scat_coef > 1e-10)
+  Cdif2 = abs(ref_abs_coef - abs_coef_all)
 
-    ## check if relative difference in scattering coefficient is within 20% for all and channels that the difference in absorption coefficient is within 1 Mm-1 for all channels
-    a1 = ((Cdif1)<0.2).astype('int')#a1[np.isinf(a1)]=0
-    a2 = ((Cdif2)<pow(10,-6)).astype('int')#
-    if (np.sum(a1) == L2) and (np.sum(a2) == L2):
-      iri[i1] = CRI_p[i1,1]
-      rri[i1] = CRI_p[i1,0]
-    ##
+  rri = None
+  iri = None
+  if estimator == 'linf-mean':
+    ## historical ISARA selection: accept candidates with ALL channels inside
+    ## tolerance, report their unweighted mean (re-verified below)
+    valid = np.logical_and((Cdif1 < 0.2).all(axis=1), (Cdif2 < pow(10, -6)).all(axis=1))
+    if np.any(valid):
+      Results["dry_CRI_n_accepted_unitless"] = int(np.sum(valid))
+      Results["dry_RRI_accepted_std_unitless"] = float(np.std(CRI_p[valid, 0]))
+      Results["dry_IRI_accepted_std_unitless"] = float(np.std(CRI_p[valid, 1]))
+      rri = np.mean(CRI_p[valid, 0])
+      iri = np.mean(CRI_p[valid, 1])
+  elif estimator == 'chi2-wmean':
+    ## Gaussian-posterior mean on the grid: reduced chi^2 with sigma equal to
+    ## the historical tolerances; success gate min reduced chi^2 <= 1; weights
+    ## exp(-n_ch*chi2/2). Continuous weights remove the acceptance-boundary
+    ## fragility of the binary gate and lower RMSE (scripts/estimator_study.py
+    ## in ASCENT-ACP, 2026-08-31).
+    n_ch = 2 * L2
+    chi2 = ((Cdif1 / 0.2) ** 2).sum(axis=1) + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
+    chi2 /= n_ch
+    k_best = int(np.nanargmin(chi2))
+    Results["dry_CRI_min_chi2_unitless"] = float(chi2[k_best])
+    if chi2[k_best] <= 1.0:
+      w = np.exp(-0.5 * n_ch * (chi2 - chi2[k_best]))
+      w = w / w.sum()
+      rri = float(w @ CRI_p[:, 0])
+      iri = float(w @ CRI_p[:, 1])
+      Results["dry_CRI_n_accepted_unitless"] = int(np.sum(chi2 <= 1.0))
+      Results["dry_RRI_accepted_std_unitless"] = float(np.sqrt(w @ (CRI_p[:, 0] - rri) ** 2))
+      Results["dry_IRI_accepted_std_unitless"] = float(np.sqrt(w @ (CRI_p[:, 1] - iri) ** 2))
+  else:
+    raise ValueError(f"estimator must be 'linf-mean' or 'chi2-wmean', got '{estimator}'")
 
-  flgs = np.logical_not(np.isnan(rri)) # flag valid solutions
-  
-  #pause()
-  #print(ref_abs_coef*10**6,abs_coef*10**6,'\n')
-  if np.sum(rri[flgs])>0: # check to see if any valid solutions exist
-    ## record the size and spread of the accepted-candidate set (retrieval
-    ## uncertainty proxy; the reported CRI is the mean of these candidates)
-    Results["dry_CRI_n_accepted_unitless"] = int(np.sum(flgs))
-    Results["dry_RRI_accepted_std_unitless"] = float(np.std(rri[flgs]))
-    Results["dry_IRI_accepted_std_unitless"] = float(np.std(iri[flgs]))
-    ## take mean rri and iri of all valid solutions and recalculate aerosol properties with mean cri values.
-    rri = np.mean(rri[flgs])
-    iri = np.mean(iri[flgs])
+  if rri is not None: # a solution was selected; forward-calculate at the reported CRI
     RRI_d = {}
     IRI_d = {}
     for imode in sd:
       RRI_d[imode] = rri
       IRI_d[imode] = iri
-    results = model(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
-    ##
-    ## same as before, check for to ensure recalculated scattering coefficients are within 20% and absorption coefficients are with 1 Mm-1 when using mean cri
+    results = model(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     scat_coef = np.full((L2),np.nan)
     abs_coef = np.full((L2),np.nan)
-
     for i2 in range(L2):
       scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-      abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1'] 
+      abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
 
-    Cd1 = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
-    Cd2 = abs(ref_abs_coef-abs_coef)
-    a1 = ((Cd1)<0.2).astype('int')
-    #a1[np.isinf(a1)]=0
-    a2 = ((Cd2)<pow(10,-6)).astype('int')
-    if (np.sum(a1) == L2) and (np.sum(a2) == L2): # if solution is valid, store dry cri and dry calculated extinction, scattering, and absorption coefficients and SSA in all measured wavelengths
+    ## the linf estimator historically re-verifies that the mean CRI itself
+    ## passes the acceptance test (the accepted set can be non-convex); the
+    ## chi2 estimator's gate is min chi^2 and needs no re-verification
+    accept = True
+    if estimator == 'linf-mean':
+      Cd1 = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
+      Cd2 = abs(ref_abs_coef-abs_coef)
+      accept = bool((Cd1 < 0.2).all() and (Cd2 < pow(10, -6)).all())
+    if accept: # store dry cri and dry calculated coefficients and SSA in all measured wavelengths
       Results["dry_RRI_unitless"] = rri
       Results["dry_IRI_unitless"] = iri
       for i2 in range(L2):
         Results[f'dry_cal_sca_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-        Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1'] 
+        Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
         Results[f'dry_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = results[f'ssa_{wvl_dict["sca"][i2]}']
         Results[f'dry_cal_SSA_{wvl_dict["abs"][i2]}_unitless'] = results[f'ssa_{wvl_dict["abs"][i2]}']
         Results[f'dry_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
         Results[f'dry_cal_ext_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
       if val_wvl is not None: # if validation wavelengths are requested, provide outputs for those wavelengths as well
-        wvl2 = None
-        for iwvl in range(len(val_wvl)):
-          if iwvl == 0:
-            wvl2 = val_wvl
-          else:
-            wvl2 = np.hstack((wvl2,val_wvl))
-        results = model(wvl2,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
+        results = model(val_wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
         for iwvl in range(len(val_wvl)):
           Results[f'dry_cal_sca_coef_{val_wvl[iwvl]}_m-1'] = results[f'ssa_{val_wvl[iwvl]}']*results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
           Results[f'dry_cal_SSA_{val_wvl[iwvl]}_unitless'] = results[f'ssa_{val_wvl[iwvl]}']
-          Results[f'dry_cal_ext_coef_{val_wvl[iwvl]}_m-1'] = results[f'ext_coeff_{val_wvl[iwvl]}_m-1']        
-    
+          Results[f'dry_cal_ext_coef_{val_wvl[iwvl]}_m-1'] = results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
+
   return Results # return dictionary (Results) of dry cri and dry calculated extinction, scattering, and absorption coefficients and SSA in all measured and validation wavelengths
 
 
@@ -493,6 +497,7 @@ def Retr_kappa(wvl_dict,
   path_optical_dataset, 
   path_mopsmap_executable,
   model=None,
+  estimator='linf-mean',
 ):
   """
   Returns aerosol particle hygroscopic growth factor from a humdified scattering coefficeint measurement, dry complex refractive index, and a measured number concentration for an aerosol size distribution. WARNINGS: 1) numpy must be installed to the python environment 2) mopsmap_wrapper.py must be present in a directory that is in your PATH.
@@ -551,54 +556,76 @@ def Retr_kappa(wvl_dict,
     Results[f'wet_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = None
     Results[f'wet_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = None
   ##  
-  stop_indx = 0 # initate stop index for first valid solution
-  RRIw = 1.33 # set rri of water 
-  IRIw = 0 # set iri of water 
-  for i1 in range(L1): # loop through each possible kappa value 
+  RRIw = 1.33 # set rri of water
+  IRIw = 0 # set iri of water
+
+  def _wet_state(kappa_val):
+    """gf-grown diameters and water-volume-mixed CRI for one kappa."""
+    gf = np.power((1+kappa_val*RH/(100-RH)),1/3)
     dpg_w = {}
     RRI_w = {}
     IRI_w = {}
     for imode in sd:
-      gf = np.power((1+kappa_p[i1]*RH/(100-RH)),1/3) # calculate growth factor given the incrimental kappa value and the measurement relative humidity for each size mode
-      #if imode == 'SMPS':
-        #dpg_w[imode] = dpg[imode] # adjust the size distribution by multplying the growth factor by each dry particle diameter in each size mode
-        #RRI_w[imode] = CRI_d[0] # volume weighted humidified rri for each size mode
-        #IRI_w[imode] = CRI_d[1] # volume weighted humidified iri for each size mode
-      #else:
-      dpg_w[imode] = np.squeeze(np.multiply(gf,dpg[imode])) # adjust the size distribution by multplying the growth factor by each dry particle diameter in each size mode
-      RRI_w[imode] = (CRI_d[0]+((gf**3)-1)*RRIw)/(gf**3) # volume weighted humidified rri for each size mode
-      IRI_w[imode] = (CRI_d[1]+((gf**3)-1)*IRIw)/(gf**3) # volume weighted humidified iri for each size mode
-    if stop_indx == 0: # stop if last solution was valid (Cdif<0.01)
-      results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given kappa
-      scat_coef = np.full((L2),np.nan)# prepare array of calculated scattering coefficients
-      ref_scat_coef = np.full((L2),np.nan) # prepare array of measured scattering coefficients
-      ## Assign values to prepared measured and calculated coefficients
-      for i2 in range(L2):
-        scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-        ref_scat_coef[i2] = optical_measurements[f'wet_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
-      ##  
-      Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10) # calculate absolute relative difference of scattering coefficients in each channel
-      if np.all(Cdif<0.01): # solution is valid if scattering coefficients are within 1%
-        Results["kappa_unitless"] = kappa_p[i1] # store retrieved kappa
-        ## store calculated scattering and extinction coefficients and SSA for measured and validation wavelengths
-        for i2 in range(L2):
-          Results[f'wet_cal_sca_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1'] 
-          Results[f'wet_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = results[f'ssa_{wvl_dict["sca"][i2]}']
-          Results[f'wet_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-        if val_wvl is not None:
-          wvl2 = None
-          for iwvl in range(len(val_wvl)):
-            if iwvl == 0:
-              wvl2 = val_wvl
-            else:
-              wvl2 = np.hstack((wvl2,val_wvl))
-          results = model(wvl2,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
-          for iwvl in range(len(val_wvl)):
-            Results[f'wet_cal_sca_coef_{val_wvl[iwvl]}_m-1'] = results[f'ssa_{val_wvl[iwvl]}']*results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
-            Results[f'wet_cal_SSA_{val_wvl[iwvl]}_unitless'] = results[f'ssa_{val_wvl[iwvl]}']
-            Results[f'wet_cal_ext_coef_{val_wvl[iwvl]}_m-1'] = results[f'ext_coeff_{val_wvl[iwvl]}_m-1'] 
-        ##        
-        stop_indx = 1 # change stop index when first valid solution is reached
+      dpg_w[imode] = np.squeeze(np.multiply(gf,dpg[imode]))
+      RRI_w[imode] = (CRI_d[0]+((gf**3)-1)*RRIw)/(gf**3)
+      IRI_w[imode] = (CRI_d[1]+((gf**3)-1)*IRIw)/(gf**3)
+    return dpg_w, RRI_w, IRI_w
+
+  ref_scat_coef = np.array([optical_measurements[f'wet_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
+                            for i2 in range(L2)], dtype=float)
+
+  def _wet_sca(kappa_val):
+    dpg_w, RRI_w, IRI_w = _wet_state(kappa_val)
+    results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+    return np.array([results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+                     for i2 in range(L2)])
+
+  kappa_sel = None
+  if estimator == 'linf-mean':
+    ## historical selection: ascending scan, FIRST kappa with all humidified
+    ## scattering channels within 1% of the measurement
+    for i1 in range(L1):
+      scat_coef = _wet_sca(kappa_p[i1])
+      Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
+      if np.all(Cdif<0.01):
+        kappa_sel = kappa_p[i1]
+        break
+  elif estimator == 'chi2-wmean':
+    ## Gaussian-posterior mean over the kappa grid, sigma = the historical 1%
+    ## per-channel tolerance; success gate min reduced chi^2 <= 1. Evaluates
+    ## the full grid (use the 'table' forward engine; per-candidate subprocess
+    ## calls make this path slow under the 'mopsmap' engine).
+    chi2 = np.full(L1, np.inf)
+    for i1 in range(L1):
+      scat_coef = _wet_sca(kappa_p[i1])
+      Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
+      chi2[i1] = np.mean((Cdif/0.01)**2)
+    k_best = int(np.nanargmin(chi2))
+    Results["kappa_min_chi2_unitless"] = float(chi2[k_best])
+    if chi2[k_best] <= 1.0:
+      w = np.exp(-0.5*L2*(chi2 - chi2[k_best]))
+      w = w / w.sum()
+      kappa_sel = float(w @ kappa_p)
+      Results["kappa_std_unitless"] = float(np.sqrt(w @ (kappa_p - kappa_sel)**2))
+  else:
+    raise ValueError(f"estimator must be 'linf-mean' or 'chi2-wmean', got '{estimator}'")
+
+  if kappa_sel is not None:
+    Results["kappa_unitless"] = kappa_sel
+    ## forward-calculate the reported humidified state at the selected kappa
+    dpg_w, RRI_w, IRI_w = _wet_state(kappa_sel)
+    results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+    for i2 in range(L2):
+      Results[f'wet_cal_sca_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+      Results[f'wet_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = results[f'ssa_{wvl_dict["sca"][i2]}']
+      Results[f'wet_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+    if val_wvl is not None:
+      results = model(val_wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+      for iwvl in range(len(val_wvl)):
+        Results[f'wet_cal_sca_coef_{val_wvl[iwvl]}_m-1'] = results[f'ssa_{val_wvl[iwvl]}']*results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
+        Results[f'wet_cal_SSA_{val_wvl[iwvl]}_unitless'] = results[f'ssa_{val_wvl[iwvl]}']
+        Results[f'wet_cal_ext_coef_{val_wvl[iwvl]}_m-1'] = results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
+
   return Results # return dictionary (Results) of kappa and wet calculated extinction, scattering, and absorption coefficients and SSA in all measured and validation wavelengths
 
 def humidified_optics(sd,
