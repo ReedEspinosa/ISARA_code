@@ -63,6 +63,7 @@ def Retr_PSD(radii_um,
   path_optical_dataset='./optical_dataset/',
   path_mopsmap_executable='./mopsmap',
   lut=None,
+  forward_engine='mopsmap',
 ):
 
   """
@@ -119,6 +120,11 @@ def Retr_PSD(radii_um,
   :type path_mopsmap_executable: str
   :param lut: Optional precomputed optics_lut.OpticsLUT for the CRI grid search. Used only when its fingerprint (bin diameters after NaN dropping, wavelengths, CRI grid, shape assumptions) matches this call; otherwise the per-candidate MOPSMAP path runs as usual, so passing a LUT never changes which retrievals are possible
   :type lut: optics_lut.OpticsLUT
+  :param forward_engine: 'mopsmap' (default; Fortran subprocess per forward call) or 'table'
+    (in-process NumPy integration over the extracted single-sphere efficiency table in
+    mopsmap_sphere_table/ -- ~100x faster, spheres only, validated to <=0.21% vs exact Mie).
+    All retrieval logic (grids, acceptance criteria, estimator) is engine-independent.
+  :type forward_engine: str
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -191,12 +197,21 @@ def Retr_PSD(radii_um,
   Rho_dry = {"PSD": rho_dry}
   Rho_wet = {"PSD": rho_wet}
 
+  ## resolve the forward model callable once; every downstream stage uses it
+  if forward_engine == 'table':
+    import sphere_optics
+    model = sphere_optics.Model
+  elif forward_engine == 'mopsmap':
+    model = MMModel
+  else:
+    raise ValueError(f"forward_engine must be 'mopsmap' or 'table', got '{forward_engine}'")
+
   finalout = {}
   finalout['attempt_flag_CRI_unitless'] = 1
   finalout['attempt_flag_kappa_unitless'] = 0
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
     Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
-    lut=lut)
+    lut=lut, model=model)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -227,7 +242,7 @@ def Retr_PSD(radii_um,
       CRI_dry = np.array([Results["dry_RRI_unitless"], Results["dry_IRI_unitless"]])
       KResults = Retr_kappa(wvl_wet, val_wvl, optical_measurements, sd, dpg, RH_wet, kappa_p,
         CRI_dry, Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
-        path_optical_dataset, path_mopsmap_executable)
+        path_optical_dataset, path_mopsmap_executable, model=model)
       for key in KResults:
         finalout[key] = KResults[key]
       if KResults["kappa_unitless"] is not None:
@@ -243,7 +258,7 @@ def Retr_PSD(radii_um,
         for tag, rh_state in states:
           hum = humidified_optics(sd, dpg, CRI_dry, kappa_ret, rh_state, all_wvl,
             Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
-            path_optical_dataset, path_mopsmap_executable)
+            path_optical_dataset, path_mopsmap_executable, model=model)
           for gkey in ("gf_unitless", "RRI_unitless", "IRI_unitless"):
             finalout[f'{tag}_{gkey}'] = hum[gkey]
           for key, value in hum.items():
@@ -270,6 +285,7 @@ def Retr_CRI(wvl_dict,
   path_optical_dataset,
   path_mopsmap_executable,
   lut=None,
+  model=None,
 ):
 
   """
@@ -303,6 +319,8 @@ def Retr_CRI(wvl_dict,
   :rtype: numpy dictionary
   """
 
+  if model is None:
+    model = MMModel
   L1 = len(CRI_p[:,0]) # length of array with all possible cri values
   L2 = len(wvl_dict["sca"]) # number of measured scattering (Sc) coefficient channels
   ## collect scattering and absorption (Abs) coefficient channel wavelengths (wvl) into array
@@ -378,7 +396,7 @@ def Retr_CRI(wvl_dict,
       RRI_p[imode] = CRI_p[i1,0]
       IRI_p[imode] = CRI_p[i1,1]
     ##
-    results = MMModel(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given cri
+    results = model(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given cri
     scat_coef = np.full((L2),np.nan)## prepare arrays of calculated scattering and absorption coefficients
     abs_coef = np.full((L2),np.nan)
     ## Assign values to prepared calculated coefficients
@@ -418,7 +436,7 @@ def Retr_CRI(wvl_dict,
     for imode in sd:
       RRI_d[imode] = rri
       IRI_d[imode] = iri
-    results = MMModel(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
+    results = model(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
     ##
     ## same as before, check for to ensure recalculated scattering coefficients are within 20% and absorption coefficients are with 1 Mm-1 when using mean cri
     scat_coef = np.full((L2),np.nan)
@@ -450,7 +468,7 @@ def Retr_CRI(wvl_dict,
             wvl2 = val_wvl
           else:
             wvl2 = np.hstack((wvl2,val_wvl))
-        results = MMModel(wvl2,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
+        results = model(wvl2,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
         for iwvl in range(len(val_wvl)):
           Results[f'dry_cal_sca_coef_{val_wvl[iwvl]}_m-1'] = results[f'ssa_{val_wvl[iwvl]}']*results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
           Results[f'dry_cal_SSA_{val_wvl[iwvl]}_unitless'] = results[f'ssa_{val_wvl[iwvl]}']
@@ -474,6 +492,7 @@ def Retr_kappa(wvl_dict,
   num_theta,
   path_optical_dataset, 
   path_mopsmap_executable,
+  model=None,
 ):
   """
   Returns aerosol particle hygroscopic growth factor from a humdified scattering coefficeint measurement, dry complex refractive index, and a measured number concentration for an aerosol size distribution. WARNINGS: 1) numpy must be installed to the python environment 2) mopsmap_wrapper.py must be present in a directory that is in your PATH.
@@ -510,6 +529,8 @@ def Retr_kappa(wvl_dict,
   :rtype: numpy dictionary
   """
 
+  if model is None:
+    model = MMModel
   L1 = len(kappa_p) # length of array with all possible kappa values
   L2 = len(wvl_dict["sca"]) # number of measured scattering (Sc) coefficient channels
 
@@ -548,7 +569,7 @@ def Retr_kappa(wvl_dict,
       RRI_w[imode] = (CRI_d[0]+((gf**3)-1)*RRIw)/(gf**3) # volume weighted humidified rri for each size mode
       IRI_w[imode] = (CRI_d[1]+((gf**3)-1)*IRIw)/(gf**3) # volume weighted humidified iri for each size mode
     if stop_indx == 0: # stop if last solution was valid (Cdif<0.01)
-      results = MMModel(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given kappa
+      results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) # calculate microphysical properties for a given kappa
       scat_coef = np.full((L2),np.nan)# prepare array of calculated scattering coefficients
       ref_scat_coef = np.full((L2),np.nan) # prepare array of measured scattering coefficients
       ## Assign values to prepared measured and calculated coefficients
@@ -571,7 +592,7 @@ def Retr_kappa(wvl_dict,
               wvl2 = val_wvl
             else:
               wvl2 = np.hstack((wvl2,val_wvl))
-          results = MMModel(wvl2,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
+          results = model(wvl2,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable) 
           for iwvl in range(len(val_wvl)):
             Results[f'wet_cal_sca_coef_{val_wvl[iwvl]}_m-1'] = results[f'ssa_{val_wvl[iwvl]}']*results[f'ext_coeff_{val_wvl[iwvl]}_m-1']
             Results[f'wet_cal_SSA_{val_wvl[iwvl]}_unitless'] = results[f'ssa_{val_wvl[iwvl]}']
@@ -593,6 +614,7 @@ def humidified_optics(sd,
   num_theta,
   path_optical_dataset,
   path_mopsmap_executable,
+  model=None,
 ):
   """
   Forward-calculate humidified optical properties at an arbitrary relative humidity.
@@ -614,6 +636,8 @@ def humidified_optics(sd,
     'SSA_{w}_unitless'
   :rtype: dict
   """
+  if model is None:
+    model = MMModel
   wvl = np.unique(np.asarray(wvl).astype(int))
   gf = np.power((1 + kappa * RH / (100 - RH)), 1/3)
   RRIw = 1.33 # rri of water
@@ -625,7 +649,7 @@ def humidified_optics(sd,
     dpg_w[imode] = np.squeeze(np.multiply(gf, dpg[imode]))
     RRI_w[imode] = (CRI_d[0]+((gf**3)-1)*RRIw)/(gf**3) # volume weighted humidified rri
     IRI_w[imode] = (CRI_d[1]+((gf**3)-1)*IRIw)/(gf**3) # volume weighted humidified iri
-  results = MMModel(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+  results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
   first_mode = next(iter(sd))
   out = {
     "gf_unitless": float(gf),
