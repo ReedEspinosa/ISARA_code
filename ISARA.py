@@ -198,6 +198,7 @@ def Retr_PSD(radii_um,
   optical_measurements = {}
   for i2 in range(wvl_dry["sca"].size):
     optical_measurements[f'dry_meas_sca_coef_{wvl_dry["sca"][i2]}_m-1'] = dry_sca[i2]
+  for i2 in range(wvl_dry["abs"].size):
     optical_measurements[f'dry_meas_abs_coef_{wvl_dry["abs"][i2]}_m-1'] = dry_abs[i2]
 
   ## validate the optional humidified inputs up front, before any MOPSMAP work
@@ -356,36 +357,28 @@ def Retr_CRI(wvl_dict,
   if model is None:
     model = MMModel
   L1 = len(CRI_p[:,0]) # length of array with all possible cri values
-  L2 = len(wvl_dict["sca"]) # number of measured scattering (Sc) coefficient channels
-  ## collect scattering and absorption (Abs) coefficient channel wavelengths (wvl) into array
-  wvl = None
-  for iwvl in range(L2):
-    if iwvl == 0:
-      wvl = np.array([wvl_dict["sca"][iwvl],wvl_dict["abs"][iwvl]])
-    else:
-      wvl = np.hstack((wvl,np.array([wvl_dict["sca"][iwvl],wvl_dict["abs"][iwvl]])))
-  ##
-  wvl = np.sort(wvl, axis=None) # sort array of wavelengths in ascending order
+  L2 = len(wvl_dict["sca"]) # number of scattering channels
+  L2a = len(wvl_dict["abs"]) # number of absorption channels (may differ)
+  wvl = np.unique(np.concatenate([np.asarray(wvl_dict["sca"]),
+                                  np.asarray(wvl_dict["abs"])]))
   ## Prepare output arrays and dictionary
   iri = np.full((L1), np.nan)
   rri = np.full((L1), np.nan)
   Results = dict()  
   Results["dry_RRI_unitless"] = None
   Results["dry_IRI_unitless"] = None
-  ref_scat_coef = np.full((L2),np.nan)## prepare arrays of measured scattering and absorption coefficients
-  ref_abs_coef = np.full((L2),np.nan)  
+  ref_scat_coef = np.full((L2),np.nan)## measured scattering coefficients
+  ref_abs_coef = np.full((L2a),np.nan) ## measured absorption coefficients
   for i2 in range(L2):
     Results[f'dry_cal_sca_coef_{wvl_dict["sca"][i2]}_m-1'] = None
-    Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = None
     Results[f'dry_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = None
-    Results[f'dry_cal_SSA_{wvl_dict["abs"][i2]}_unitless'] = None
     Results[f'dry_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = None
-    Results[f'dry_cal_ext_coef_{wvl_dict["abs"][i2]}_m-1'] = None
-    ## Assign values to prepared measured coefficients
     ref_scat_coef[i2] = optical_measurements[f'dry_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
+  for i2 in range(L2a):
+    Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = None
+    Results[f'dry_cal_SSA_{wvl_dict["abs"][i2]}_unitless'] = None
+    Results[f'dry_cal_ext_coef_{wvl_dict["abs"][i2]}_m-1'] = None
     ref_abs_coef[i2] = optical_measurements[f'dry_meas_abs_coef_{wvl_dict["abs"][i2]}_m-1']
-    ##
-  ##
   ## Decide whether the (optional) precomputed optics LUT can replace the
   ## per-candidate MOPSMAP subprocess calls of the grid search. The LUT is
   ## applicable only for a single-mode PSD on exactly its bin grid with the
@@ -401,12 +394,12 @@ def Retr_CRI(wvl_dict,
     )
 
   scat_coef_all = np.full((L1, L2), np.nan)
-  abs_coef_all = np.full((L1, L2), np.nan)
+  abs_coef_all = np.full((L1, L2a), np.nan)
   if use_lut:
     ## vectorized grid search: coefficients for ALL candidates as dot products
     ext_all, sca_all = lut.coefficients(sd[lut_mode])  # (L1, n_wvl) each
     i_sca = [lut.wavelength_index(wvl_dict["sca"][i2]) for i2 in range(L2)]
-    i_abs = [lut.wavelength_index(wvl_dict["abs"][i2]) for i2 in range(L2)]
+    i_abs = [lut.wavelength_index(wvl_dict["abs"][i2]) for i2 in range(L2a)]
     scat_coef_all = sca_all[:, i_sca]
     abs_coef_all = ext_all[:, i_abs] - sca_all[:, i_abs]
   else:
@@ -419,6 +412,7 @@ def Retr_CRI(wvl_dict,
     results = model(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     for i2 in range(L2):
       scat_coef_all[i1, i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+    for i2 in range(L2a):
       abs_coef_all[i1, i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
 
   ## shared misfit measures for both estimators (identical tolerances:
@@ -445,12 +439,12 @@ def Retr_CRI(wvl_dict,
     ## exp(-n_ch*chi2/2). Continuous weights remove the acceptance-boundary
     ## fragility of the binary gate and lower RMSE (scripts/estimator_study.py
     ## in ASCENT-ACP, 2026-08-31).
-    n_ch = 2 * L2
+    n_ch = L2 + L2a
     if obs_cov is not None:
       ## generalized chi^2 with the full observation+model covariance:
       ## residual vector r = [sca..., abs...] per candidate
       r = np.hstack([scat_coef_all - ref_scat_coef.reshape(1, L2),
-                     abs_coef_all - ref_abs_coef.reshape(1, L2)])
+                     abs_coef_all - ref_abs_coef.reshape(1, L2a)])
       S_inv = np.linalg.inv(np.asarray(obs_cov, float))
       chi2 = np.einsum('ki,ij,kj->k', r, S_inv, r) / n_ch
     elif sca_sigma is not None:
@@ -458,7 +452,7 @@ def Retr_CRI(wvl_dict,
       sig_s = np.asarray(sca_sigma, float).reshape(1, L2)
       chi2 = (((Cdif1 * ref_scat_coef) / sig_s) ** 2).sum(axis=1)
       if abs_sigma is not None:
-        sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
+        sig_a = np.asarray(abs_sigma, float).reshape(1, L2a)
         chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
       else:
         chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
@@ -466,7 +460,7 @@ def Retr_CRI(wvl_dict,
     else:
       chi2 = ((Cdif1 / 0.2) ** 2).sum(axis=1)
       if abs_sigma is not None:
-        sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
+        sig_a = np.asarray(abs_sigma, float).reshape(1, L2a)
         chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
       else:
         chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
@@ -492,9 +486,10 @@ def Retr_CRI(wvl_dict,
       IRI_d[imode] = iri
     results = model(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     scat_coef = np.full((L2),np.nan)
-    abs_coef = np.full((L2),np.nan)
+    abs_coef = np.full((L2a),np.nan)
     for i2 in range(L2):
       scat_coef[i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+    for i2 in range(L2a):
       abs_coef[i2] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
 
     ## the linf estimator historically re-verifies that the mean CRI itself
@@ -510,10 +505,11 @@ def Retr_CRI(wvl_dict,
       Results["dry_IRI_unitless"] = iri
       for i2 in range(L2):
         Results[f'dry_cal_sca_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
-        Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
         Results[f'dry_cal_SSA_{wvl_dict["sca"][i2]}_unitless'] = results[f'ssa_{wvl_dict["sca"][i2]}']
-        Results[f'dry_cal_SSA_{wvl_dict["abs"][i2]}_unitless'] = results[f'ssa_{wvl_dict["abs"][i2]}']
         Results[f'dry_cal_ext_coef_{wvl_dict["sca"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
+      for i2 in range(L2a):
+        Results[f'dry_cal_abs_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']-results[f'ssa_{wvl_dict["abs"][i2]}']*results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
+        Results[f'dry_cal_SSA_{wvl_dict["abs"][i2]}_unitless'] = results[f'ssa_{wvl_dict["abs"][i2]}']
         Results[f'dry_cal_ext_coef_{wvl_dict["abs"][i2]}_m-1'] = results[f'ext_coeff_{wvl_dict["abs"][i2]}_m-1']
       if val_wvl is not None: # if validation wavelengths are requested, provide outputs for those wavelengths as well
         results = model(val_wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
