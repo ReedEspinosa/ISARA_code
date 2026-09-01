@@ -65,6 +65,9 @@ def Retr_PSD(radii_um,
   lut=None,
   forward_engine='mopsmap',
   estimator='linf-mean',
+  sca_sigma=None,
+  abs_sigma=None,
+  wet_sigma=None,
 ):
 
   """
@@ -136,6 +139,11 @@ def Retr_PSD(radii_um,
     in the ASCENT-ACP estimator study (scripts/estimator_study.py, 2026-08-31); evaluates
     the full kappa grid, so pair it with forward_engine='table'.
   :type estimator: str
+  :param sca_sigma: Optional per-channel 1-sigma uncertainties (m^-1, order of dry_wvl['sca'])
+    used by the 'chi2-wmean' estimator in place of the default 20% relative tolerance;
+    abs_sigma likewise replaces the 1 Mm-1 absolute tolerance and wet_sigma (order of
+    wet_wvl['sca']) the 1% humidified tolerance. None keeps the legacy tolerances.
+  :type sca_sigma: numpy array
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -222,7 +230,8 @@ def Retr_PSD(radii_um,
   finalout['attempt_flag_kappa_unitless'] = 0
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
     Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
-    lut=lut, model=model, estimator=estimator)
+    lut=lut, model=model, estimator=estimator,
+    sca_sigma=sca_sigma, abs_sigma=abs_sigma)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -254,7 +263,7 @@ def Retr_PSD(radii_um,
       KResults = Retr_kappa(wvl_wet, val_wvl, optical_measurements, sd, dpg, RH_wet, kappa_p,
         CRI_dry, Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
         path_optical_dataset, path_mopsmap_executable, model=model,
-        estimator=estimator)
+        estimator=estimator, wet_sigma=wet_sigma)
       for key in KResults:
         finalout[key] = KResults[key]
       if KResults["kappa_unitless"] is not None:
@@ -299,6 +308,8 @@ def Retr_CRI(wvl_dict,
   lut=None,
   model=None,
   estimator='linf-mean',
+  sca_sigma=None,
+  abs_sigma=None,
 ):
 
   """
@@ -425,7 +436,17 @@ def Retr_CRI(wvl_dict,
     ## fragility of the binary gate and lower RMSE (scripts/estimator_study.py
     ## in ASCENT-ACP, 2026-08-31).
     n_ch = 2 * L2
-    chi2 = ((Cdif1 / 0.2) ** 2).sum(axis=1) + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
+    if sca_sigma is not None:
+      ## instrument-model sigmas (absolute, m^-1); Cdif1 is |dy|/ref so undo
+      sig_s = np.asarray(sca_sigma, float).reshape(1, L2)
+      chi2 = (((Cdif1 * ref_scat_coef) / sig_s) ** 2).sum(axis=1)
+    else:
+      chi2 = ((Cdif1 / 0.2) ** 2).sum(axis=1)
+    if abs_sigma is not None:
+      sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
+      chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
+    else:
+      chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
     chi2 /= n_ch
     k_best = int(np.nanargmin(chi2))
     Results["dry_CRI_min_chi2_unitless"] = float(chi2[k_best])
@@ -498,6 +519,7 @@ def Retr_kappa(wvl_dict,
   path_mopsmap_executable,
   model=None,
   estimator='linf-mean',
+  wet_sigma=None,
 ):
   """
   Returns aerosol particle hygroscopic growth factor from a humdified scattering coefficeint measurement, dry complex refractive index, and a measured number concentration for an aerosol size distribution. WARNINGS: 1) numpy must be installed to the python environment 2) mopsmap_wrapper.py must be present in a directory that is in your PATH.
@@ -596,10 +618,15 @@ def Retr_kappa(wvl_dict,
     ## the full grid (use the 'table' forward engine; per-candidate subprocess
     ## calls make this path slow under the 'mopsmap' engine).
     chi2 = np.full(L1, np.inf)
+    if wet_sigma is not None:
+      sig_w = np.asarray(wet_sigma, float).reshape(-1)
     for i1 in range(L1):
       scat_coef = _wet_sca(kappa_p[i1])
-      Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
-      chi2[i1] = np.mean((Cdif/0.01)**2)
+      if wet_sigma is not None:
+        chi2[i1] = np.mean(((scat_coef - ref_scat_coef) / sig_w) ** 2)
+      else:
+        Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
+        chi2[i1] = np.mean((Cdif/0.01)**2)
     k_best = int(np.nanargmin(chi2))
     Results["kappa_min_chi2_unitless"] = float(chi2[k_best])
     if chi2[k_best] <= 1.0:
