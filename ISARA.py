@@ -69,6 +69,7 @@ def Retr_PSD(radii_um,
   abs_sigma=None,
   wet_sigma=None,
   obs_cov=None,
+  sizing_corr=None,
 ):
 
   """
@@ -153,6 +154,13 @@ def Retr_PSD(radii_um,
     forgiven, inconsistent spectral shapes still fail. Overrides sca_sigma/abs_sigma in the
     CRI stage (the kappa stage keeps wet_sigma).
   :type obs_cov: numpy array
+  :param sizing_corr: Optional optical-sizer RI correction: dict with 'shift' and 'wr'
+    (n_candidates x n_input_bins arrays of lnD center shifts and bin-width ratios, identity
+    for non-optical bins) and 'cri_grid' (the same candidate grid as CRI_p). Each CRI
+    candidate is forward-modeled with its own corrected bin diameters (counts conserved via
+    the width Jacobian); the kappa and humidified stages use the correction at the retrieved
+    dry CRI (nearest grid candidate). Build with ASCENT-ACP sizing_correction.build_state.
+  :type sizing_corr: dict
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -180,6 +188,11 @@ def Retr_PSD(radii_um,
   order = np.argsort(radii)
   radii = radii[order]
   dndlogdp = dndlogdp[order]
+  if sizing_corr is not None:
+    cols = np.where(valid)[0][order]   # surviving input-bin indices, sorted
+    sizing_corr = {"shift": np.asarray(sizing_corr["shift"])[:, cols],
+                   "wr": np.asarray(sizing_corr["wr"])[:, cols],
+                   "cri_grid": np.asarray(sizing_corr["cri_grid"])}
   if np.any(np.diff(radii) <= 0):
     raise ValueError("radii_um contains duplicate values; bin locations must be unique.")
   sd = {"PSD": np.multiply(dndlogdp, pow(10, 6))} # cm^-3 -> m^-3
@@ -241,7 +254,8 @@ def Retr_PSD(radii_um,
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
     Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
     lut=lut, model=model, estimator=estimator,
-    sca_sigma=sca_sigma, abs_sigma=abs_sigma, obs_cov=obs_cov)
+    sca_sigma=sca_sigma, abs_sigma=abs_sigma, obs_cov=obs_cov,
+    sizing_corr=sizing_corr)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -270,6 +284,10 @@ def Retr_PSD(radii_um,
     if cri_success and np.all(np.isfinite(wet_sca)) and np.all(wet_sca > 0):
       finalout['attempt_flag_kappa_unitless'] = 1
       CRI_dry = np.array([Results["dry_RRI_unitless"], Results["dry_IRI_unitless"]])
+      if sizing_corr is not None:
+        k = _nearest_sizing_candidate(sizing_corr, CRI_dry[0], CRI_dry[1])
+        dpg = {m: dpg[m] * np.exp(sizing_corr["shift"][k]) for m in dpg}
+        sd = {m: sd[m] / sizing_corr["wr"][k] for m in sd}
       KResults = Retr_kappa(wvl_wet, val_wvl, optical_measurements, sd, dpg, RH_wet, kappa_p,
         CRI_dry, Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
         path_optical_dataset, path_mopsmap_executable, model=model,
@@ -302,6 +320,11 @@ def Retr_PSD(radii_um,
       finalout[key] = np.nan
   return finalout
 
+def _nearest_sizing_candidate(sizing_corr, rri, iri):
+  g = sizing_corr["cri_grid"]
+  return int(np.argmin((g[:, 0] - rri) ** 2 + (g[:, 1] - iri) ** 2))
+
+
 def Retr_CRI(wvl_dict,
   val_wvl, 
   optical_measurements,
@@ -321,6 +344,7 @@ def Retr_CRI(wvl_dict,
   sca_sigma=None,
   abs_sigma=None,
   obs_cov=None,
+  sizing_corr=None,
 ):
 
   """
@@ -385,7 +409,7 @@ def Retr_CRI(wvl_dict,
   ## same wavelengths, CRI grid and particle assumptions; in every other case
   ## the original subprocess loop below runs unchanged.
   use_lut = False
-  if lut is not None and len(sd) == 1:
+  if lut is not None and len(sd) == 1 and sizing_corr is None:
     lut_mode = next(iter(sd))
     use_lut = (
       np.all(np.isfinite(sd[lut_mode]))
@@ -409,7 +433,13 @@ def Retr_CRI(wvl_dict,
     for imode in sd:
       RRI_p[imode] = CRI_p[i1,0]
       IRI_p[imode] = CRI_p[i1,1]
-    results = model(wvl,size_equ,sd,dpg,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
+    if sizing_corr is not None:
+      ## each candidate RI sees its own corrected optical-sizer diameters
+      dpg_c = {m: dpg[m] * np.exp(sizing_corr["shift"][i1]) for m in dpg}
+      sd_c = {m: sd[m] / sizing_corr["wr"][i1] for m in sd}
+    else:
+      dpg_c, sd_c = dpg, sd
+    results = model(wvl,size_equ,sd_c,dpg_c,RRI_p,IRI_p,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     for i2 in range(L2):
       scat_coef_all[i1, i2] = results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
     for i2 in range(L2a):
@@ -484,6 +514,10 @@ def Retr_CRI(wvl_dict,
     for imode in sd:
       RRI_d[imode] = rri
       IRI_d[imode] = iri
+    if sizing_corr is not None:
+      k = _nearest_sizing_candidate(sizing_corr, rri, iri)
+      sd = {m: sd[m] / sizing_corr["wr"][k] for m in sd}
+      dpg = {m: dpg[m] * np.exp(sizing_corr["shift"][k]) for m in dpg}
     results = model(wvl,size_equ,sd,dpg,RRI_d,IRI_d,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
     scat_coef = np.full((L2),np.nan)
     abs_coef = np.full((L2a),np.nan)

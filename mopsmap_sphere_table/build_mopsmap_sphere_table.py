@@ -22,11 +22,22 @@ import datetime
 
 import numpy as np
 import netCDF4 as nc
+from numpy.polynomial import legendre
+
+# Optical-sizer collection geometry for the qsca_partial response kernel.
+# Moore et al. (2021, AMT, doi:10.5194/amt-14-4517-2021) integrate the phase
+# function over the UHSAS collection angles for BOTH the UHSAS and the LAS:
+# 33-147 deg with the 72.5-104.8 deg band blocked. Using the same geometry
+# keeps this kernel consistent with their published response curves.
+GEOM_THETA = (33.0, 147.0)
+GEOM_BLOCKED = (72.5, 104.8)
+XMAX_PARTIAL = 60.0   # size parameter ceiling for the partial kernel (covers
+                      # LAS to 6 um at 633 nm and UHSAS through 1 um at 1054)
 
 DEFAULT_SRC = ("/Users/wrespino/Synced/Resources/GeneralSoftware/MOPSMAP/"
                "mopsmap/optical_dataset/spheres/")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   "mopsmap_spheres_v1.nc")
+                   "mopsmap_spheres_v2.nc")
 
 
 def main(src):
@@ -42,14 +53,31 @@ def main(src):
   with nc.Dataset(grid[(mrs[0], mis[0])]) as d:
     sp = d["sizepara"][:].filled(np.nan)
 
+  th = np.linspace(0.0, np.pi, 1441)
+  mu, sinth = np.cos(th), np.sin(th)
+  wmask = ((th >= np.deg2rad(GEOM_THETA[0])) & (th <= np.deg2rad(GEOM_THETA[1]))
+           & ~((th >= np.deg2rad(GEOM_BLOCKED[0]))
+               & (th <= np.deg2rad(GEOM_BLOCKED[1]))))
+  wfun = np.where(wmask, sinth, 0.0)
+  sel_part = sp <= XMAX_PARTIAL
+
   qext = np.full((len(mrs), len(mis), len(sp)), np.nan, np.float32)
   qsca = np.full_like(qext, np.nan)
+  qpart = np.full_like(qext, np.nan)
   for i, mr in enumerate(mrs):
+    print(f"  mr {mr:.2f} ({i + 1}/{len(mrs)})", flush=True)
     for j, mi in enumerate(mis):
       with nc.Dataset(grid[(mr, mi)]) as d:
         assert np.array_equal(d["sizepara"][:].filled(np.nan), sp)
         qext[i, j] = d["qext"][:].filled(np.nan)
         qsca[i, j] = d["qsca"][:].filled(np.nan)
+        lmax = d["lmax"][:].filled(0).astype(int)
+        offs = np.r_[0, np.cumsum(lmax + 1)]
+        a1 = d["a1"][:].filled(np.nan)
+        for k in np.where(sel_part)[0]:
+          coef = a1[offs[k]:offs[k] + lmax[k] + 1]
+          frac = 0.5 * np.trapz(legendre.legval(mu, coef) * wfun, th)
+          qpart[i, j, k] = qsca[i, j, k] * frac
 
   with nc.Dataset(OUT, "w") as o:
     o.createDimension("mreal", len(mrs))
@@ -65,12 +93,23 @@ def main(src):
     v[:] = sp
     v.long_name = "size parameter 2*pi*r/lambda"
     for name, arr, ln in [("qext", qext, "extinction efficiency"),
-                          ("qsca", qsca, "scattering efficiency")]:
+                          ("qsca", qsca, "scattering efficiency"),
+                          ("qsca_partial", qpart,
+                           "partial scattering efficiency into the optical-"
+                           "sizer collection solid angle")]:
       v = o.createVariable(name, "f4", ("mreal", "mimag", "sizepara"),
                            zlib=True, complevel=4, shuffle=True)
       v[:] = arr
       v.long_name = ln + " (exact Mie, single sphere)"
       v.units = "dimensionless"
+    v = o["qsca_partial"]
+    v.collection_theta_deg = GEOM_THETA
+    v.blocked_theta_deg = GEOM_BLOCKED
+    v.comment = ("qsca * (1/2) int P11 sin(theta) dtheta over 33-147 deg "
+                 "minus the blocked 72.5-104.8 deg band (Moore et al. 2021 "
+                 "geometry, applied to both LAS and UHSAS); computed from "
+                 "the MOPSMAP a1 (ALPH1) Legendre expansion; NaN above "
+                 f"size parameter {XMAX_PARTIAL}")
     o.title = "MOPSMAP sphere single-particle efficiencies (extract)"
     o.source = ("Extracted from the MOPSMAP v1.0 optical dataset, "
                 "spheres subset (qext/qsca only)")
