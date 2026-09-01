@@ -68,6 +68,7 @@ def Retr_PSD(radii_um,
   sca_sigma=None,
   abs_sigma=None,
   wet_sigma=None,
+  obs_cov=None,
 ):
 
   """
@@ -144,6 +145,14 @@ def Retr_PSD(radii_um,
     abs_sigma likewise replaces the 1 Mm-1 absolute tolerance and wet_sigma (order of
     wet_wvl['sca']) the 1% humidified tolerance. None keeps the legacy tolerances.
   :type sca_sigma: numpy array
+  :param obs_cov: Optional full (2*n_ch x 2*n_ch) observation+model covariance in (m^-1)^2,
+    channel order [sca channels..., abs channels...]. When given, the chi2-wmean CRI search
+    uses the generalized chi^2 r' S^-1 r / n_ch, which MARGINALIZES over correlated model
+    uncertainties (e.g. the LAS diameter-scale and impactor-parameter terms) encoded as
+    rank-1 outer products in S: residual patterns matching a known nuisance direction are
+    forgiven, inconsistent spectral shapes still fail. Overrides sca_sigma/abs_sigma in the
+    CRI stage (the kappa stage keeps wet_sigma).
+  :type obs_cov: numpy array
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -231,7 +240,7 @@ def Retr_PSD(radii_um,
   Results = Retr_CRI(wvl_dry, val_wvl, optical_measurements, sd, dpg, CRI_p, Size_equ,
     Nonabs_fraction, Shape, Rho_dry, num_theta, path_optical_dataset, path_mopsmap_executable,
     lut=lut, model=model, estimator=estimator,
-    sca_sigma=sca_sigma, abs_sigma=abs_sigma)
+    sca_sigma=sca_sigma, abs_sigma=abs_sigma, obs_cov=obs_cov)
   for key in Results:
     finalout[key] = Results[key]
   cri_success = Results["dry_RRI_unitless"] is not None
@@ -310,6 +319,7 @@ def Retr_CRI(wvl_dict,
   estimator='linf-mean',
   sca_sigma=None,
   abs_sigma=None,
+  obs_cov=None,
 ):
 
   """
@@ -436,18 +446,31 @@ def Retr_CRI(wvl_dict,
     ## fragility of the binary gate and lower RMSE (scripts/estimator_study.py
     ## in ASCENT-ACP, 2026-08-31).
     n_ch = 2 * L2
-    if sca_sigma is not None:
+    if obs_cov is not None:
+      ## generalized chi^2 with the full observation+model covariance:
+      ## residual vector r = [sca..., abs...] per candidate
+      r = np.hstack([scat_coef_all - ref_scat_coef.reshape(1, L2),
+                     abs_coef_all - ref_abs_coef.reshape(1, L2)])
+      S_inv = np.linalg.inv(np.asarray(obs_cov, float))
+      chi2 = np.einsum('ki,ij,kj->k', r, S_inv, r) / n_ch
+    elif sca_sigma is not None:
       ## instrument-model sigmas (absolute, m^-1); Cdif1 is |dy|/ref so undo
       sig_s = np.asarray(sca_sigma, float).reshape(1, L2)
       chi2 = (((Cdif1 * ref_scat_coef) / sig_s) ** 2).sum(axis=1)
+      if abs_sigma is not None:
+        sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
+        chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
+      else:
+        chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
+      chi2 /= n_ch
     else:
       chi2 = ((Cdif1 / 0.2) ** 2).sum(axis=1)
-    if abs_sigma is not None:
-      sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
-      chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
-    else:
-      chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
-    chi2 /= n_ch
+      if abs_sigma is not None:
+        sig_a = np.asarray(abs_sigma, float).reshape(1, L2)
+        chi2 = chi2 + ((Cdif2 / sig_a) ** 2).sum(axis=1)
+      else:
+        chi2 = chi2 + ((Cdif2 / pow(10, -6)) ** 2).sum(axis=1)
+      chi2 /= n_ch
     k_best = int(np.nanargmin(chi2))
     Results["dry_CRI_min_chi2_unitless"] = float(chi2[k_best])
     if chi2[k_best] <= 1.0:

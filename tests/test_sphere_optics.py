@@ -129,3 +129,25 @@ def test_linf_estimator_still_works_on_table_engine():
                        CRI_p=ISARA.default_CRI_grid(1.47, 1.56), **kw)
   assert out['attempt_flag_CRI_unitless'] == 2
   assert abs(out['dry_RRI_unitless'] - 1.52) < 0.02
+
+
+def test_obs_cov_forgives_patterned_residual_only():
+  """Full-covariance chi2: a residual along a nuisance direction passes,
+  the same-size residual in an inconsistent pattern fails."""
+  import ISARA
+  kw, dpg, dnd = _retr_kwargs(estimator='chi2-wmean')
+  sca, ab = _forward_truth(dpg, dnd, 1.52, 0.005)
+  meas_sig = np.r_[0.05 * sca, 0.3e-6 * np.ones(3)]
+  # nuisance direction: common multiplicative shift of all sca channels
+  dy = np.r_[0.25 * sca, np.zeros(3)]
+  S = np.diag(meas_sig ** 2) + np.outer(dy, dy)
+  patterned = sca * 1.22          # ~1 sigma along the nuisance direction
+  odd = sca * np.array([1.22, 1.0, 0.82])   # same size, wrong shape
+  ok = ISARA.Retr_PSD(dry_sca_coef=patterned, dry_abs_coef=ab,
+                      CRI_p=ISARA.default_CRI_grid(1.47, 1.56),
+                      obs_cov=S, **kw)
+  bad = ISARA.Retr_PSD(dry_sca_coef=odd, dry_abs_coef=ab,
+                       CRI_p=ISARA.default_CRI_grid(1.47, 1.56),
+                       obs_cov=S, **kw)
+  assert ok['attempt_flag_CRI_unitless'] == 2
+  assert bad['dry_CRI_min_chi2_unitless'] > ok['dry_CRI_min_chi2_unitless'] * 3
