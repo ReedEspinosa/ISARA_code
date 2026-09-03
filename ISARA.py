@@ -21,14 +21,24 @@ def default_CRI_grid(rri_min=1.51, rri_max=1.54, rri_step=0.01):
       io += 1
   return CRI_p
 
-def default_kappa_grid():
+def default_kappa_grid(kappa_min=0.0):
   """
   Returns the default grid of candidate hygroscopicity (kappa) values searched by Retr_kappa.
 
+  :param kappa_min: Lower grid edge (default 0.0, the historical grid). A slightly negative
+    floor (e.g. -0.1) lets windows whose humidified target implies enhancement < 1 retrieve
+    an EFFECTIVE near-zero/negative kappa instead of failing, and keeps the posterior mean
+    unbiased near kappa = 0. Candidates whose kappa-Kohler gf^3 would fall below GF3_MIN at
+    the fit RH are excluded inside Retr_kappa (gf^3 <= 0 is complex; small gf^3 diverges in
+    the water-volume-mixing RI).
   :return: 1-D array of kappa values
   :rtype: numpy array
   """
-  return np.arange(0.0, 1.40, 0.001).reshape(-1)
+  return np.arange(kappa_min, 1.40, 0.001).reshape(-1)
+
+## gf^3 floor for kappa candidates: below this the water-volume-mixed CRI
+## (division by gf^3) is untrustworthy, and gf^3 <= 0 is outright complex
+GF3_MIN = 0.3
 
 def _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl):
   """Sorted union (nm, int) of every wavelength the retrieval should report."""
@@ -332,11 +342,16 @@ def Retr_PSD(radii_um,
       if KResults["kappa_unitless"] is not None:
         finalout['attempt_flag_kappa_unitless'] = 2
         ## report the full humidified state (all output wavelengths, humidified
-        ## CRI, growth factor) at the retrieval RH, and optionally at ambient RH
+        ## CRI, growth factor) at the retrieval RH, and optionally at ambient RH.
+        ## A NEGATIVE retrieved kappa is an effective/statistical value
+        ## (enhancement target below 1); it is not literal water uptake, so the
+        ## humidified/ambient forward states are skipped (left NaN) -- this also
+        ## keeps every published grown state real-valued at any RH < 100.
         kappa_ret = KResults["kappa_unitless"]
         all_wvl = _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl)
-        states = [("wet", RH_wet)]
-        if RH_ambient is not None and np.isfinite(RH_ambient) and 0 < RH_ambient < 100:
+        states = [("wet", RH_wet)] if kappa_ret >= 0 else []
+        if (kappa_ret >= 0 and RH_ambient is not None
+            and np.isfinite(RH_ambient) and 0 < RH_ambient < 100):
           states.append(("amb", RH_ambient))
           finalout['RH_ambient_percent'] = float(RH_ambient)
         for tag, rh_state in states:
@@ -708,11 +723,18 @@ def Retr_kappa(wvl_dict,
     return np.array([results[f'ssa_{wvl_dict["sca"][i2]}']*results[f'ext_coeff_{wvl_dict["sca"][i2]}_m-1']
                      for i2 in range(L2)])
 
+  ## exclude kappa candidates whose grown state would be complex or divergent
+  ## (gf^3 = 1 + kappa*RH/(100-RH) at or below GF3_MIN); only relevant when the
+  ## grid extends negative
+  gf3_ok = (1.0 + np.asarray(kappa_p, dtype=float) * RH / (100.0 - RH)) >= GF3_MIN
+
   kappa_sel = None
   if estimator == 'linf-mean':
     ## historical selection: ascending scan, FIRST kappa with all humidified
     ## scattering channels within 1% of the measurement
     for i1 in range(L1):
+      if not gf3_ok[i1]:
+        continue
       scat_coef = _wet_sca(kappa_p[i1]) / fit_scale
       Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
       if np.all(Cdif<0.01):
@@ -727,6 +749,8 @@ def Retr_kappa(wvl_dict,
     if wet_sigma is not None:
       sig_w = np.asarray(wet_sigma, float).reshape(-1)
     for i1 in range(L1):
+      if not gf3_ok[i1]:
+        continue  # chi2 stays inf -> zero posterior weight
       scat_coef = _wet_sca(kappa_p[i1]) / fit_scale
       if wet_sigma is not None:
         chi2[i1] = np.mean(((scat_coef - ref_scat_coef) / sig_w) ** 2)
@@ -799,7 +823,12 @@ def humidified_optics(sd,
   if model is None:
     model = MMModel
   wvl = np.unique(np.asarray(wvl).astype(int))
-  gf = np.power((1 + kappa * RH / (100 - RH)), 1/3)
+  gf3 = 1 + kappa * RH / (100 - RH)
+  if not gf3 >= GF3_MIN:
+    raise ValueError(f"kappa={kappa} at RH={RH}% gives gf^3={gf3:.3f} < {GF3_MIN}: "
+                     "complex/divergent humidified state (negative kappa states "
+                     "are effective values; do not forward-model them)")
+  gf = np.power(gf3, 1/3)
   RRIw = 1.33 # rri of water
   IRIw = 0.0 # iri of water
   dpg_w = {}
