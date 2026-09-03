@@ -70,6 +70,7 @@ def Retr_PSD(radii_um,
   wet_sigma=None,
   obs_cov=None,
   sizing_corr=None,
+  kappa_fit='absolute',
 ):
 
   """
@@ -161,6 +162,24 @@ def Retr_PSD(radii_um,
     the width Jacobian); the kappa and humidified stages use the correction at the retrieved
     dry CRI (nearest grid candidate). Build with ASCENT-ACP sizing_correction.build_state.
   :type sizing_corr: dict
+  :param kappa_fit: Objective of the kappa stage. 'absolute' (default, historical) fits the
+    forward-modeled humidified scattering directly to wet_sca_coef. 'ratio' divides the
+    forward-modeled humidified scattering by the DRY CLOSURE factor (forward-modeled dry
+    scattering at the retrieved CRI / measured dry scattering, per wet channel wavelength)
+    before comparing to wet_sca_coef — i.e. the fit constrains the scattering ENHANCEMENT
+    E = wet/dry rather than the absolute coefficient. Any PSD amplitude error (sizer
+    undercounting/undersizing) then cancels instead of leaking into kappa; under 'absolute',
+    kappa is the only remaining amplitude degree of freedom once the CRI is bounded by its
+    grid/prior, so it absorbs the full dry-closure error (a 0.6x dry closure inflates kappa
+    by roughly the same factor the enhancement is overstated). 'ratio' is also the framing
+    the wet_sigma budget assumes (nephelometer calibration cancelling between the wet target
+    and the dry measurement). Wet channels without a finite dry closure (no matching dry
+    scattering channel, or CRI-stage dry coefficients unavailable) fall back to unscaled.
+    The reported wet_cal_* coefficients remain the raw forward model, so under 'ratio' the
+    ratio wet_cal/dry_cal matches wet_meas/dry_meas at the selected kappa, while wet_cal
+    itself differs from wet_meas by the dry closure factor. The closure factor used per wet
+    channel is reported as 'kappa_dry_closure_{wvl}_unitless'.
+  :type kappa_fit: str
   :return: Dictionary with retrieved dry CRI (and kappa when attempted), calculated coefficients/SSA at the measured (and validation) wavelengths, and attempt flags (0 no attempt, 1 attempt, 2 success); failed values are NaN
   :rtype: dict
 
@@ -225,6 +244,8 @@ def Retr_PSD(radii_um,
     if wet_sca.size != wvl_wet["sca"].size:
       raise ValueError("wet_sca_coef length must match wet_wvl['sca'].")
 
+  if kappa_fit not in ('absolute', 'ratio'):
+    raise ValueError(f"kappa_fit must be 'absolute' or 'ratio', got '{kappa_fit}'")
   if CRI_p is None:
     CRI_p = default_CRI_grid()
   if kappa_p is None:
@@ -288,10 +309,24 @@ def Retr_PSD(radii_um,
         k = _nearest_sizing_candidate(sizing_corr, CRI_dry[0], CRI_dry[1])
         dpg = {m: dpg[m] * np.exp(sizing_corr["shift"][k]) for m in dpg}
         sd = {m: sd[m] / sizing_corr["wr"][k] for m in sd}
+      dry_closure = None
+      if kappa_fit == 'ratio':
+        ## per-wet-channel dry closure = forward-modeled dry scattering at the
+        ## retrieved CRI (same sizing-corrected PSD the kappa stage grows) over
+        ## the measured dry scattering; non-finite -> that channel unscaled
+        dry_closure = np.full(wvl_wet["sca"].size, np.nan)
+        for i2 in range(wvl_wet["sca"].size):
+          wch = wvl_wet["sca"][i2]
+          cal = finalout.get(f'dry_cal_sca_coef_{wch}_m-1')
+          meas = optical_measurements.get(f'dry_meas_sca_coef_{wch}_m-1')
+          if (cal is not None and meas is not None
+              and np.isfinite(cal) and np.isfinite(meas) and meas > 1e-10):
+            dry_closure[i2] = cal / meas
+          finalout[f'kappa_dry_closure_{wch}_unitless'] = dry_closure[i2]
       KResults = Retr_kappa(wvl_wet, val_wvl, optical_measurements, sd, dpg, RH_wet, kappa_p,
         CRI_dry, Size_equ, Nonabs_fraction, Shape, Rho_wet, num_theta,
         path_optical_dataset, path_mopsmap_executable, model=model,
-        estimator=estimator, wet_sigma=wet_sigma)
+        estimator=estimator, wet_sigma=wet_sigma, dry_closure=dry_closure)
       for key in KResults:
         finalout[key] = KResults[key]
       if KResults["kappa_unitless"] is not None:
@@ -573,9 +608,19 @@ def Retr_kappa(wvl_dict,
   model=None,
   estimator='linf-mean',
   wet_sigma=None,
+  dry_closure=None,
 ):
   """
   Returns aerosol particle hygroscopic growth factor from a humdified scattering coefficeint measurement, dry complex refractive index, and a measured number concentration for an aerosol size distribution. WARNINGS: 1) numpy must be installed to the python environment 2) mopsmap_wrapper.py must be present in a directory that is in your PATH.
+
+  When ``dry_closure`` is given (one factor per scattering channel: forward-modeled dry
+  scattering at the retrieved CRI / measured dry scattering), the forward-modeled humidified
+  scattering is divided by it before comparison with the measured target, so the fit
+  constrains the scattering enhancement wet/dry instead of the absolute coefficient (the
+  'ratio' kappa objective; see Retr_PSD's ``kappa_fit``). Non-finite or non-positive factors
+  leave their channel unscaled. ``wet_sigma`` stays in measured-wet space and is unchanged.
+  The returned ``wet_cal_*`` values remain the raw (unscaled) forward model at the selected
+  kappa.
   
   :param wvl_dict: Dictionary of wavelengths associated with each of the scattering and absorption measurements
   :type wvl_dict: numpy dictionary
@@ -649,6 +694,14 @@ def Retr_kappa(wvl_dict,
   ref_scat_coef = np.array([optical_measurements[f'wet_meas_sca_coef_{wvl_dict["sca"][i2]}_m-1']
                             for i2 in range(L2)], dtype=float)
 
+  ## 'ratio' objective: divide the forward model by the per-channel dry
+  ## closure so PSD amplitude errors cancel out of the kappa fit
+  fit_scale = np.ones(L2)
+  if dry_closure is not None:
+    dc = np.asarray(dry_closure, dtype=float).reshape(-1)
+    ok = np.isfinite(dc) & (dc > 0)
+    fit_scale[ok] = dc[ok]
+
   def _wet_sca(kappa_val):
     dpg_w, RRI_w, IRI_w = _wet_state(kappa_val)
     results = model(wvl,size_equ,sd,dpg_w,RRI_w,IRI_w,nonabs_fraction,shape,rho,0,0,num_theta,path_optical_dataset,path_mopsmap_executable)
@@ -660,7 +713,7 @@ def Retr_kappa(wvl_dict,
     ## historical selection: ascending scan, FIRST kappa with all humidified
     ## scattering channels within 1% of the measurement
     for i1 in range(L1):
-      scat_coef = _wet_sca(kappa_p[i1])
+      scat_coef = _wet_sca(kappa_p[i1]) / fit_scale
       Cdif = np.divide(abs(ref_scat_coef-scat_coef), ref_scat_coef, out=np.full_like(ref_scat_coef, np.inf), where=ref_scat_coef>1e-10)
       if np.all(Cdif<0.01):
         kappa_sel = kappa_p[i1]
@@ -674,7 +727,7 @@ def Retr_kappa(wvl_dict,
     if wet_sigma is not None:
       sig_w = np.asarray(wet_sigma, float).reshape(-1)
     for i1 in range(L1):
-      scat_coef = _wet_sca(kappa_p[i1])
+      scat_coef = _wet_sca(kappa_p[i1]) / fit_scale
       if wet_sigma is not None:
         chi2[i1] = np.mean(((scat_coef - ref_scat_coef) / sig_w) ** 2)
       else:
