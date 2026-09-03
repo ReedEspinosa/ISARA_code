@@ -88,8 +88,9 @@ GRID CELL WIDTH (quadrature measure, 2026-09-03), so the posterior
 integrates against a uniform prior regardless of grid density — without
 this the quasi-zero IRI cluster acted as a delta-prior at 0 and pulled
 the mean IRI low (absorption under-forecast in clean air). Point
-estimates: RRI = posterior mean; IRI = posterior MEDIAN (boundary-robust
-on the one-sided IRI >= 0 axis). Success gate min reduced chi^2 <= 1;
+estimates: RRI = posterior mean; IRI = CONTINUOUS posterior median (piecewise-linear CDF over the
+grid cells, interpolated 0.5 crossing; boundary-robust on the one-sided
+IRI >= 0 axis without snapping to grid nodes). Success gate min reduced chi^2 <= 1;
 reported diagnostics: min chi^2, n(chi^2<=1), posterior-weighted stds of
 RRI and IRI. `estimator='linf-mean'` reproduces the historical mean of
 L-infinity-accepted candidates (re-verified at the mean). The estimator

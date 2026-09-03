@@ -62,10 +62,30 @@ def _axis_cell_widths(vals):
   return np.diff(edges)[np.searchsorted(u, vals)]
 
 def _weighted_median(vals, w):
-  """Weighted median: boundary-robust point estimate for one-sided posteriors."""
-  order = np.argsort(vals)
-  cw = np.cumsum(w[order])
-  return float(np.asarray(vals)[order][np.searchsorted(cw, 0.5 * cw[-1])])
+  """CONTINUOUS weighted median: boundary-robust point estimate for one-sided
+  posteriors that does not snap to grid atoms.
+
+  Each candidate's weight is spread uniformly over its grid cell (the same
+  trapezoid cells as _axis_cell_widths), giving a piecewise-linear CDF whose
+  exact 0.5 crossing is returned by interpolation within the owning cell. A
+  plain discrete weighted quantile always returns a grid NODE, which
+  quantized the reported IRI at the local grid spacing (0.001 bands).
+  """
+  vals = np.asarray(vals, dtype=float)
+  w = np.asarray(w, dtype=float)
+  u = np.unique(vals)
+  if u.size < 2:
+    return float(u[0])
+  wu = np.zeros(u.size)
+  np.add.at(wu, np.searchsorted(u, vals), w)
+  wu = wu / wu.sum()
+  edges = np.concatenate(([u[0]], (u[:-1] + u[1:]) / 2.0, [u[-1]]))
+  cdf = np.concatenate(([0.0], np.cumsum(wu)))
+  k = int(np.clip(np.searchsorted(cdf, 0.5) - 1, 0, u.size - 1))
+  c0, c1 = cdf[k], cdf[k + 1]
+  if c1 <= c0:
+    return float(u[k])
+  return float(edges[k] + (edges[k + 1] - edges[k]) * (0.5 - c0) / (c1 - c0))
 
 def _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl):
   """Sorted union (nm, int) of every wavelength the retrieval should report."""
