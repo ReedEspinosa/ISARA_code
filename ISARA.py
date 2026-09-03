@@ -6,13 +6,18 @@ def default_CRI_grid(rri_min=1.51, rri_max=1.54, rri_step=0.01):
   """
   Returns the default grid of candidate complex refractive index (CRI) values searched by Retr_CRI.
   The RRI range is parameterizable (defaults preserve the historical 1.51-1.54 grid); the IRI
-  grid is fixed at 0, 1e-7..1e-4 decades, then 0.001-0.030 in 0.001 steps.
+  grid is 0, 1e-7..1e-4 decades, 2.5e-4/5e-4/7.5e-4 (2026-09-03: fills the former factor-10
+  resolution gap between 1e-4 and 1e-3, where clean-air IRI posteriors live), then 0.001-0.030
+  in 0.001 steps. Grid density does NOT act as a prior under the chi2-wmean estimator (the
+  posterior weights are corrected by the per-candidate grid cell width), so the non-uniform
+  ladder only sets resolution.
 
   :return: 2-D array of shape (N, 2) where column 0 is RRI and column 1 is IRI
   :rtype: numpy array
   """
   RRIp = np.arange(rri_min, rri_max + rri_step/2.0, rri_step).reshape(-1)
-  IRIp = np.hstack((0, 10**(-7), 10**(-6), 10**(-5), 10**(-4), np.arange(0.001, 0.031, 0.001).reshape(-1)))
+  IRIp = np.hstack((0, 10**(-7), 10**(-6), 10**(-5), 10**(-4), 2.5e-4, 5e-4, 7.5e-4,
+                    np.arange(0.001, 0.031, 0.001).reshape(-1)))
   CRI_p = np.empty((len(IRIp)*len(RRIp), 2))
   io = 0
   for i1 in range(len(IRIp)):
@@ -39,6 +44,28 @@ def default_kappa_grid(kappa_min=0.0):
 ## gf^3 floor for kappa candidates: below this the water-volume-mixed CRI
 ## (division by gf^3) is untrustworthy, and gf^3 <= 0 is outright complex
 GF3_MIN = 0.3
+
+def _axis_cell_widths(vals):
+  """Per-candidate quadrature weight along one grid axis.
+
+  Half-distance between neighboring UNIQUE grid values (trapezoid cells, end
+  cells half-width), so the chi2-wmean posterior integrates against a UNIFORM
+  measure regardless of grid density. Without this, locally dense regions
+  (e.g. the quasi-zero IRI decade points) act as an implicit prior spike that
+  pulls the posterior mean toward them.
+  """
+  vals = np.asarray(vals, dtype=float)
+  u = np.unique(vals)
+  if u.size < 2:
+    return np.ones(vals.shape, dtype=float)
+  edges = np.concatenate(([u[0]], (u[:-1] + u[1:]) / 2.0, [u[-1]]))
+  return np.diff(edges)[np.searchsorted(u, vals)]
+
+def _weighted_median(vals, w):
+  """Weighted median: boundary-robust point estimate for one-sided posteriors."""
+  order = np.argsort(vals)
+  cw = np.cumsum(w[order])
+  return float(np.asarray(vals)[order][np.searchsorted(cw, 0.5 * cw[-1])])
 
 def _output_wavelengths(wvl_dry, wvl_wet, val_wvl, out_wvl):
   """Sorted union (nm, int) of every wavelength the retrieval should report."""
@@ -150,7 +177,12 @@ def Retr_PSD(radii_um,
     adds dry_CRI_min_chi2 / kappa_min_chi2 / kappa_std outputs, and the *_accepted_std
     outputs become posterior-weighted stds. Best RMSE and ~+30% more successful retrievals
     in the ASCENT-ACP estimator study (scripts/estimator_study.py, 2026-08-31); evaluates
-    the full kappa grid, so pair it with forward_engine='table'.
+    the full kappa grid, so pair it with forward_engine='table'. 2026-09-03: posterior
+    weights are corrected by the per-candidate grid cell width (quadrature measure), so a
+    locally dense grid no longer acts as an implicit prior spike; IRI is reported as the
+    posterior MEDIAN (boundary-robust against the one-sided IRI >= 0 axis, which biased the
+    mean low and left absorption under-forecast in clean air), RRI and kappa remain
+    posterior means.
   :type estimator: str
   :param sca_sigma: Optional per-channel 1-sigma uncertainties (m^-1, order of dry_wvl['sca'])
     used by the 'chi2-wmean' estimator in place of the default 20% relative tolerance;
@@ -548,13 +580,21 @@ def Retr_CRI(wvl_dict,
     k_best = int(np.nanargmin(chi2))
     Results["dry_CRI_min_chi2_unitless"] = float(chi2[k_best])
     if chi2[k_best] <= 1.0:
+      ## quadrature weights: exp(-chi2/2) times the grid cell measure, so the
+      ## non-uniform IRI ladder does not bias the posterior integrals
       w = np.exp(-0.5 * n_ch * (chi2 - chi2[k_best]))
+      w = w * _axis_cell_widths(CRI_p[:, 0]) * _axis_cell_widths(CRI_p[:, 1])
       w = w / w.sum()
       rri = float(w @ CRI_p[:, 0])
-      iri = float(w @ CRI_p[:, 1])
+      ## IRI: posterior MEDIAN, robust against the one-sided IRI >= 0 boundary
+      ## (the mean of a zero-pressed posterior over-forecasts nothing, but the
+      ## former density-spike-pulled mean under-forecast absorption; the
+      ## median is the standard boundary-safe point estimate)
+      iri = _weighted_median(CRI_p[:, 1], w)
+      iri_mean = float(w @ CRI_p[:, 1])
       Results["dry_CRI_n_accepted_unitless"] = int(np.sum(chi2 <= 1.0))
       Results["dry_RRI_accepted_std_unitless"] = float(np.sqrt(w @ (CRI_p[:, 0] - rri) ** 2))
-      Results["dry_IRI_accepted_std_unitless"] = float(np.sqrt(w @ (CRI_p[:, 1] - iri) ** 2))
+      Results["dry_IRI_accepted_std_unitless"] = float(np.sqrt(w @ (CRI_p[:, 1] - iri_mean) ** 2))
   else:
     raise ValueError(f"estimator must be 'linf-mean' or 'chi2-wmean', got '{estimator}'")
 
@@ -761,6 +801,7 @@ def Retr_kappa(wvl_dict,
     Results["kappa_min_chi2_unitless"] = float(chi2[k_best])
     if chi2[k_best] <= 1.0:
       w = np.exp(-0.5*L2*(chi2 - chi2[k_best]))
+      w = w * _axis_cell_widths(kappa_p)  # no-op on the uniform default grid
       w = w / w.sum()
       kappa_sel = float(w @ kappa_p)
       Results["kappa_std_unitless"] = float(np.sqrt(w @ (kappa_p - kappa_sel)**2))
