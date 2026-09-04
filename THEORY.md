@@ -1,4 +1,4 @@
-# ISARA retrieval: theory basis (as implemented, 2026-08-31)
+# ISARA retrieval: theory basis (as implemented, 2026-09-03)
 
 This documents the algorithm as it stands in this repository. The
 campaign-pipeline layer (QC, windowing, PSD construction, impactor
@@ -62,7 +62,8 @@ but degrade for quasi-monodisperse PSDs; full analysis in ASCENT-ACP
 ## 3. Dry CRI grid search (`Retr_CRI`)
 
 Candidates: the Cartesian grid RRI in [1.47, 1.56] step 0.01 (config) x
-IRI in {0, 1e-7..1e-4 decades, 0.001..0.030 step 0.001} — 350 pairs.
+IRI in {0, 1e-7..1e-4 decades, 2.5/5/7.5e-4, 0.001..0.030 step 0.001}
+(the sub-0.001 points added 2026-09-03 for clean-air resolution).
 For every candidate the forward model predicts the 3+3 dry channels.
 
 **Misfit.** Three nested options (`estimator` / sigma inputs):
@@ -81,30 +82,59 @@ For every candidate the forward model predicts the 3+3 dry channels.
    nuisance direction is forgiven; an inconsistent spectral shape of the
    same size still fails.
 
-**Solution.** `estimator='chi2-wmean'` (default in ASCENT-ACP): the
-Gaussian-posterior weighted mean over the grid, weights
-w_i = exp(-1/2 chi2_tot,i), success gate min reduced chi^2 <= 1;
+**Solution.** `estimator='chi2-wmean'` (default in ASCENT-ACP):
+posterior weights w_i = exp(-1/2 chi2_tot,i) times the per-candidate
+GRID CELL WIDTH (quadrature measure, 2026-09-03), so the posterior
+integrates against a uniform prior regardless of grid density — without
+this the quasi-zero IRI cluster acted as a delta-prior at 0 and pulled
+the mean IRI low (absorption under-forecast in clean air). Point
+estimates: RRI = posterior mean; IRI = CONTINUOUS posterior median (piecewise-linear CDF over the
+grid cells, interpolated 0.5 crossing; boundary-robust on the one-sided
+IRI >= 0 axis without snapping to grid nodes). Success gate min reduced chi^2 <= 1;
 reported diagnostics: min chi^2, n(chi^2<=1), posterior-weighted stds of
 RRI and IRI. `estimator='linf-mean'` reproduces the historical mean of
 L-infinity-accepted candidates (re-verified at the mean). The estimator
 study (ASCENT-ACP `scripts/estimator_study.py`) showed the weighted mean
 has the best RMSE and smallest bias of the candidates considered, and
 its continuous weights remove the acceptance-boundary fragility of
-binary gates.
+binary gates. Note the flip side of continuous posterior weighting: when
+the likelihood is flat along a state direction (RRI under the
+marginalized covariance), the reported value is the GRID-PRIOR mean —
+the grid bounds are then a prior statement, not a formality.
 
 ## 4. Kappa retrieval (`Retr_kappa`)
 
-Scan kappa in [0, 1.4) step 0.001. For each candidate: grow all bins by
-gf, mix the CRI with water by volume, forward-model the humidified
-scattering channel(s). Selection mirrors the CRI stage: historical =
-first kappa with all channels within 1% (ascending scan; biases low);
-`chi2-wmean` = posterior mean with sigma = `wet_sigma` (or the 1%
+Scan kappa over the caller's grid (ASCENT-ACP: [-0.10, 1.4) step 0.001;
+library default floor 0). For each candidate: grow all bins by gf, mix
+the CRI with water by volume, forward-model the humidified scattering
+channel(s). Candidates whose gf^3 = 1 + kappa*RH/(100-RH) falls below
+GF3_MIN = 0.3 are excluded (gf^3 <= 0 is complex; small gf^3 diverges in
+the water-volume-mixing RI) — only relevant for negative-kappa grids.
+Selection mirrors the CRI stage: historical = first kappa with all
+channels within 1% (ascending scan; biases low); `chi2-wmean` =
+posterior mean (quadrature-weighted) with sigma = `wet_sigma` (or the 1%
 legacy), gate min reduced chi^2 <= 1, reporting kappa_min_chi2 and the
-posterior std. Because the ASCENT-ACP fitting target is SYNTHESIZED from
+posterior std.
+
+**Objective** (`kappa_fit`, 2026-09-03): `'absolute'` (library default)
+fits the forward humidified coefficient to the target directly;
+`'ratio'` (ASCENT-ACP default) divides the forward humidified scattering
+by the DRY CLOSURE (forward dry / measured dry at the retrieved CRI)
+first, so the fit constrains the ENHANCEMENT E = wet/dry. Rationale:
+with the CRI bounded by its grid, kappa is otherwise the only remaining
+amplitude degree of freedom and absorbs the full PSD amplitude error
+(SEAC4RS: LAS dry closure ~0.61 inflated kappa ~6x vs the UHSAS run of
+the same air). Because the ASCENT-ACP fitting target is SYNTHESIZED from
 the same dry nephelometer channel (dry Sc550 gamma-adjusted), instrument
 calibration cancels in the ratio; the appropriate wet sigma is the
 gamma-parameterization uncertainty (~1%) plus the non-cancelling noise
-floor — not the full instrument model.
+floor — not the full instrument model. The `'ratio'` objective makes the
+residual consistent with that sigma budget.
+
+A NEGATIVE retrieved kappa (target enhancement < 1) is an effective/
+statistical value — consistent with zero growth under target noise —
+not literal water loss; `Retr_PSD` skips the humidified/ambient forward
+states for kappa < 0 (attempt flag still 2).
 
 ## 5. Humidified states (`humidified_optics`)
 
